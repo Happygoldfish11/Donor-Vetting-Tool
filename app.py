@@ -123,7 +123,7 @@ REPUBLICAN_COMMITTEE_KEYWORDS = [
     "america first", "trump", "conservative", "right to rise",
     "club for growth", "freedom works", "tea party", "heritage action",
     "citizens united", "crossroads", "american crossroads",
-    "congressional leadership fund", "senate leadership fund"
+    "congressional leadership fund", "senate leadership fund", "israel"
 ]
 
 def is_republican_recipient(committee_name: str, party: str) -> bool:
