@@ -178,6 +178,28 @@ def lookup_donor(first_name, last_name, api_key):
 # --------------------------------------------------------------------------- #
 # REBNY lookup
 # --------------------------------------------------------------------------- #
+def clean_person_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+def rebny_visible_name_match(page_text, first_name, last_name):
+    first = clean_person_text(first_name)
+    last = clean_person_text(last_name)
+
+    if not first or not last:
+        return False
+
+    first_last = re.compile(rf"\b{re.escape(first)}\b.*\b{re.escape(last)}\b")
+    last_first = re.compile(rf"\b{re.escape(last)}\b.*\b{re.escape(first)}\b")
+
+    for line in page_text.splitlines():
+        line = clean_person_text(line)
+        if first_last.search(line) or last_first.search(line):
+            return True
+
+    return False
+
+
 def lookup_rebny(first_name, last_name):
     """
     Uses a headless Chromium browser (Playwright) to search the REBNY member
@@ -211,44 +233,52 @@ def lookup_rebny(first_name, last_name):
             page = browser.new_page()
             page.goto(url, wait_until="networkidle", timeout=25000)
 
-            # Wait up to 8 s for the result count or no-results text to appear
+            # Wait up to 8 s for the directory area to finish rendering.
             try:
                 page.wait_for_selector(
-                    "text=/\\d+ Member|No Search Results/",
+                    "text=/No Search Results|Member Directory|Members?/",
                     timeout=8000,
                 )
             except Exception:
                 pass
 
-            html = page.content()
+            try:
+                page_text = page.locator("body").inner_text(timeout=5000)
+            except Exception:
+                page_text = page.content()
+
             browser.close()
 
-        # "3 Members" / "1 Member" / "0 Members"
-        count_match = re.search(r"(\d+)\s*Members?", html, re.IGNORECASE)
-        if count_match:
-            count = int(count_match.group(1))
-            if count == 0:
-                return {
-                    "rebny_status": "not found",
-                    "rebny_match": False,
-                    "rebny_detail": "Not in REBNY directory",
-                }
+        count_match = re.search(r"(\d+)\s*Members?", page_text, re.IGNORECASE)
+        count = int(count_match.group(1)) if count_match else 0
+
+        # Do not trust the generic page count by itself. The old code marked
+        # everyone as a member when the page contained text like "3 Members".
+        # Only mark FOUND when the searched person's name is visible in the result text.
+        if rebny_visible_name_match(page_text, first_name, last_name):
+            detail = "Name appears in REBNY directory results"
+            if count > 0:
+                detail = f"Name appears in REBNY directory results ({count} result(s) shown)"
             return {
                 "rebny_status": "FOUND",
                 "rebny_match": True,
-                "rebny_detail": f"{count} result(s) found in REBNY directory",
+                "rebny_detail": detail,
             }
 
-        if re.search(r"No Search Results", html, re.IGNORECASE):
+        if re.search(r"No Search Results", page_text, re.IGNORECASE) or count == 0:
             return {
                 "rebny_status": "not found",
                 "rebny_match": False,
                 "rebny_detail": "Not in REBNY directory",
             }
 
-        default["rebny_status"] = "parse error"
-        default["rebny_detail"] = "Page loaded but result unclear - check rebny.com/members manually"
-        return default
+        return {
+            "rebny_status": "review",
+            "rebny_match": False,
+            "rebny_detail": (
+                f"{count} directory result(s) shown, but {query} was not visible as an exact result"
+            ),
+        }
 
     except Exception as e:
         default["rebny_detail"] = f"Error: {e}"
