@@ -444,7 +444,18 @@ def _lookup_rebny_cached(first_name: str, last_name: str) -> tuple:
     return tuple(result.to_dict().items())
 
 
-def lookup_rebny(first_name: str, last_name: str) -> dict:
+def lookup_rebny(
+    first_name: str,
+    last_name: str,
+    polite_delay_seconds: float = 0.0,
+    **_: object,
+) -> dict:
+    """Look up a person in the public REBNY member directory.
+
+    polite_delay_seconds is accepted for compatibility with app.py versions that
+    pass it in the REBNY loop. Extra keyword arguments are ignored so older and
+    newer app.py versions do not break each other.
+    """
     first_name = _clean_text(str(first_name or ""))
     last_name = _clean_text(str(last_name or ""))
     if not first_name or not last_name:
@@ -471,6 +482,13 @@ def lookup_rebny(first_name: str, last_name: str) -> dict:
                 rebny_match=False,
                 rebny_detail=f"REBNY lookup failed: {second_error or first_error}",
             ).to_dict()
+    finally:
+        try:
+            delay = float(polite_delay_seconds or 0)
+        except (TypeError, ValueError):
+            delay = 0
+        if delay > 0:
+            time.sleep(delay)
 
 
 # Compatibility aliases for older app versions.
