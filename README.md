@@ -1,148 +1,78 @@
-# Donor Vetting Tool — REBNY + OpenFEC
+# Donor Vetting Tool
 
-This is a corrected, production-style Streamlit app for batch vetting names against:
+Streamlit app for checking uploaded names against:
 
-1. **OpenFEC Schedule A itemized contributions** for Republican-classified recipients.
-2. **REBNY's public Member Directory** for real-estate-board membership.
+1. OpenFEC Schedule A contribution records
+2. A local REBNY member cache stored as `data/rebny_members.xlsx`
 
-The important fix: **REBNY results are no longer based on a member-count string.** The app extracts returned member candidates and only marks `FOUND` when the returned candidate name itself matches the searched first and last name.
-
----
-
-## Why the original app was unreliable
-
-The old REBNY logic treated any parsed `N Members` count greater than zero as a confirmed match. That creates false positives when the public directory page returns a generic count, stale shell content, unrelated cards, or a partially-rendered result. The new logic is conservative:
-
-- Fetch the public REBNY directory search page for the person.
-- Extract actual member card/name candidates from HTML/JSON/text.
-- Score each candidate against the searched first and last name.
-- Return:
-  - `FOUND` only for strong first+last matches.
-  - `review` for close/ambiguous matches.
-  - `not found` for no actual candidate match.
-
----
-
-## Files
+## Repo layout
 
 ```text
-app.py                         Streamlit UI
-requirements.txt               Python dependencies
-.streamlit/config.toml          Dark theme config
-donor_vetting/
-  batch.py                      Spreadsheet column detection + row parsing
-  excel.py                      Colored Excel export
-  fec.py                        OpenFEC lookup/classification
-  models.py                     Typed result objects
-  normalization.py              Name normalization + similarity helpers
-  rebny.py                      REBNY directory fetch/parse/match logic
-tests/
-  test_normalization.py
-  test_rebny.py
-  test_fec.py
-run_tests.py                    Dependency-light offline test runner
+.
+├── app.py
+├── vetting_core.py
+├── requirements.txt
+├── packages.txt
+├── tools/
+│   └── download_rebny_members.py
+├── tests/
+├── data/
+│   └── .gitkeep
+└── .streamlit/
+    └── config.toml
 ```
 
----
-
-## Install
+## Run locally
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-Optional, but recommended for JS-rendered fallback:
-
-```bash
-playwright install chromium
-```
-
-The app first tries normal HTTP. If the REBNY page returns only a shell and Playwright is installed, it falls back to headless Chromium rendering.
-
----
-
-## Run
-
-```bash
+python -m playwright install chromium
 streamlit run app.py
 ```
 
-Upload a `.csv` or `.xlsx` with either:
+## Build the REBNY cache
 
-- `First Name` and `Last Name`, or
-- `Full Name`
+Run this once locally:
 
-Optional disambiguation columns:
-
-- `State`
-- `Zip`
-- `Employer`
-- `Occupation`
-
-State and Zip are passed into the FEC lookup when present, and then records are still locally re-filtered by exact donor name.
-
----
-
-## OpenFEC key
-
-The app works with `DEMO_KEY`, but a real key is strongly recommended for batch runs:
-
-```text
-https://api.open.fec.gov/developers/
+```bash
+python tools/download_rebny_members.py --output data/rebny_members.xlsx --deep
 ```
 
-Paste the key in the sidebar. It is not saved.
+Then commit `data/rebny_members.xlsx` to the repo.
 
----
+The app also lets you upload a REBNY cache XLSX/CSV from the sidebar. The cache can use any of these column names:
 
-## REBNY accuracy policy
+- `name`, `member name`, or `full name`
+- optional `company`
+- optional `title`
+- optional `profile_url`
 
-The REBNY checker uses the public member directory page. It does **not** claim access to the private REBNY RLS or any private member database.
+## Input spreadsheet
 
-A REBNY result means:
+Required columns:
 
-- `FOUND`: the app found a returned public-directory candidate whose first and last name match the searched person.
-- `review`: the directory returned a close but ambiguous candidate, such as an initial-only match.
-- `not found`: no returned candidate matched the searched first+last name.
-- `error`: the public directory could not be reached or parsed.
+- `First Name`
+- `Last Name`
 
-The app intentionally avoids bulk-copying REBNY's directory. It performs live lookup-by-name checks with throttling and caching.
+Optional columns:
 
----
+- `State`
+- `Zip` or `Zip Code`
+
+State and Zip improve FEC disambiguation.
+
+## Streamlit Cloud
+
+1. Upload this whole repo to GitHub.
+2. In Streamlit Cloud, set the main file to `app.py`.
+3. Optional: add `FEC_API_KEY` in Streamlit secrets.
+4. Commit `data/rebny_members.xlsx`, or upload the cache through the app sidebar.
 
 ## Tests
 
-Run the dependency-light test runner:
-
 ```bash
 python run_tests.py
+pytest
 ```
-
-Or with pytest:
-
-```bash
-pytest -q
-```
-
-The included tests cover:
-
-- name normalization,
-- FEC donor-name matching,
-- Republican recipient classification,
-- REBNY candidate extraction,
-- REBNY exact match / review / not-found logic,
-- the specific count-based false-positive bug.
-
----
-
-## Notes for deployment
-
-If deploying to Streamlit Community Cloud or another hosted environment, include:
-
-```bash
-playwright install chromium
-```
-
-in your build/startup steps if you want rendered-page fallback. If you do not install Playwright, the HTTP parser still works when REBNY returns server-rendered content, but JS-only responses may return `error`/`not found` instead of rendered results.

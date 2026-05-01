@@ -1,209 +1,168 @@
 from __future__ import annotations
 
-import io
-import time
-from dataclasses import asdict
-from typing import Any
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from donor_vetting.batch import people_from_dataframe, people_preview_rows
-from donor_vetting.excel import dataframe_to_excel_bytes
-from donor_vetting.fec import lookup_donor
-from donor_vetting.models import Person
-from donor_vetting.rebny import lookup_rebny
+from vetting_core import (
+    DEFAULT_FEC_YEARS,
+    DEFAULT_REBNY_CACHE_PATH,
+    build_results_dataframe,
+    dataframe_to_xlsx_bytes,
+    load_rebny_members,
+    lookup_fec,
+    lookup_rebny_from_members,
+    people_from_dataframe,
+    people_preview_rows,
+    read_spreadsheet,
+    results_summary,
+)
 
 st.set_page_config(page_title="Donor Vetting Tool", page_icon="🔍", layout="wide")
 
 st.markdown(
     """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
-html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-.stApp { background: #0d1117; color: #e6edf3; }
-h1, h2, h3 { font-weight: 700; letter-spacing: -0.02em; }
-.hero { text-align:center; padding: 2rem 0 1rem; }
-.hero h1 { font-size: 2.4rem; margin: .3rem 0; color:#e6edf3; }
-.hero p { color:#8b949e; margin:0; font-size:1rem; }
-.badge { display:inline-block; color:#58a6ff; background:#10243a; border:1px solid #30363d; border-radius:999px; padding:.2rem .75rem; font-family:'DM Mono', monospace; font-size:.78rem; }
-.info-box { background:#142033; border-left: 3px solid #388bfd; color:#b9c4d0; border-radius:0 8px 8px 0; padding:.85rem 1rem; margin:.75rem 0; }
-.small-muted { color:#8b949e; font-size:.86rem; }
-.metric-card { background:#161b22; border:1px solid #30363d; border-radius:14px; padding:1rem; }
-</style>
-""",
+    <style>
+    .main .block-container { padding-top: 2rem; max-width: 1200px; }
+    .small-muted { color: #6b7280; font-size: 0.9rem; }
+    .metric-card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 1rem; }
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-<div class="hero">
-  <div class="badge">OpenFEC · Public REBNY Member Directory · Exact-match vetting</div>
-  <h1>🔍 Donor Vetting Tool</h1>
-  <p>Upload names, check federal campaign contributions, and verify REBNY membership without count-based false positives.</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+st.title("🔍 Donor Vetting Tool")
+st.caption("Upload names, check OpenFEC records, and match against a local REBNY member cache.")
 
 with st.sidebar:
     st.header("Settings")
-    st.caption("API keys are used only in this browser session.")
-    api_key = st.text_input("OpenFEC API key", type="password", placeholder="DEMO_KEY", help="Get a free key from api.open.fec.gov/developers.") or "DEMO_KEY"
-
-    st.subheader("Checks")
-    run_fec = st.checkbox("FEC Republican donation check", value=True)
-    run_rebny = st.checkbox("REBNY public member-directory check", value=True)
-
-    st.subheader("FEC scope")
-    cycles = st.multiselect(
-        "Election cycles",
-        options=[2026, 2024, 2022, 2020, 2018, 2016, 2014, 2012],
-        default=[2026, 2024, 2022],
+    api_key = st.text_input(
+        "OpenFEC API key",
+        type="password",
+        value=st.secrets.get("FEC_API_KEY", "") if hasattr(st, "secrets") else "",
+        help="Leave blank to use DEMO_KEY. A personal key is more reliable for larger files.",
     )
-    max_pages = st.slider("Max FEC pages per person", min_value=1, max_value=100, value=50, help="100 records per page. Increase for very common names.")
-    common_name_threshold = st.slider("Review threshold for common names", min_value=5, max_value=100, value=25)
 
-    st.subheader("Politeness")
-    rebny_delay = st.number_input("REBNY delay per lookup (seconds)", min_value=0.0, max_value=5.0, value=0.35, step=0.05)
-    fec_delay = st.number_input("FEC delay per lookup (seconds)", min_value=0.0, max_value=5.0, value=0.05, step=0.05)
+    years_text = st.text_input(
+        "FEC two-year periods",
+        value=", ".join(str(year) for year in DEFAULT_FEC_YEARS),
+        help="Example: 2026, 2024, 2022",
+    )
 
-st.markdown("### 1) Upload spreadsheet")
-st.markdown(
-    '<div class="info-box">Accepted columns: <b>First Name</b> + <b>Last Name</b>, or one <b>Full Name</b> column. Optional disambiguators: <b>State</b>, <b>Zip</b>, <b>Employer</b>, <b>Occupation</b>.</div>',
-    unsafe_allow_html=True,
-)
+    run_fec = st.checkbox("Run FEC check", value=True)
+    run_rebny = st.checkbox("Run REBNY check", value=True)
 
-uploaded = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"], label_visibility="collapsed")
+    st.divider()
+    st.subheader("REBNY cache")
+    cache_upload = st.file_uploader(
+        "Optional: upload rebny_members.xlsx",
+        type=["xlsx", "csv"],
+        help="If not uploaded, the app uses data/rebny_members.xlsx in the repo.",
+    )
 
+    cache_exists = DEFAULT_REBNY_CACHE_PATH.exists()
+    if cache_upload:
+        st.success("Using uploaded REBNY cache.")
+    elif cache_exists:
+        st.success(f"Using {DEFAULT_REBNY_CACHE_PATH}.")
+    else:
+        st.warning("No REBNY cache found yet.")
+        st.code("python tools/download_rebny_members.py --output data/rebny_members.xlsx --deep")
 
-def read_uploaded_file(file: Any) -> pd.DataFrame:
-    if file.name.lower().endswith(".csv"):
-        return pd.read_csv(file)
-    return pd.read_excel(file)
+uploaded = st.file_uploader("Upload donor spreadsheet", type=["xlsx", "csv"])
 
+if not uploaded:
+    st.info("Your file needs First Name and Last Name columns. Optional State and Zip columns improve FEC matching.")
+    st.stop()
 
-def result_row_base(person: Person) -> dict[str, Any]:
-    return {
-        "First Name": person.first_name,
-        "Last Name": person.last_name,
-        "State": person.state,
-        "Zip": person.zip_code,
-        "Employer": person.employer,
-        "Occupation": person.occupation,
-    }
+try:
+    source_df = read_spreadsheet(uploaded)
+    people, column_map = people_from_dataframe(source_df)
+except Exception as exc:
+    st.error(str(exc))
+    st.stop()
 
+if not people:
+    st.error("No people found in the uploaded file.")
+    st.stop()
 
-def run_checks(people: list[Person]) -> pd.DataFrame:
-    progress = st.progress(0, text="Starting vetting...")
+st.subheader("Preview")
+st.write(f"Loaded **{len(people)}** people.")
+st.dataframe(people_preview_rows(people), use_container_width=True, hide_index=True)
+
+try:
+    fec_years = [int(part.strip()) for part in years_text.split(",") if part.strip()]
+except ValueError:
+    st.error("FEC years must be comma-separated numbers, like: 2026, 2024, 2022")
+    st.stop()
+
+if st.button("Run vetting", type="primary", use_container_width=True):
+    if not run_fec and not run_rebny:
+        st.warning("Select at least one check.")
+        st.stop()
+
+    rebny_members = []
+    if run_rebny:
+        with st.spinner("Loading REBNY cache..."):
+            rebny_members = load_rebny_members(cache_upload if cache_upload else DEFAULT_REBNY_CACHE_PATH)
+        if not rebny_members:
+            st.warning("REBNY check will return REVIEW until a cache is uploaded or committed to data/rebny_members.xlsx.")
+
+    progress = st.progress(0)
     status = st.empty()
-    rows: list[dict[str, Any]] = []
-    total = len(people)
 
-    for index, person in enumerate(people, start=1):
-        status.markdown(
-            f'<div class="info-box">Checking <b>{person.full_name}</b> ({index} of {total})...</div>',
-            unsafe_allow_html=True,
-        )
-        row = result_row_base(person)
+    rebny_results = {} if run_rebny else None
+    fec_results = {} if run_fec else None
 
-        if run_fec:
-            fec = lookup_donor(
+    for number, person in enumerate(people, start=1):
+        status.write(f"Checking {person.full_name} ({number}/{len(people)})")
+
+        if run_rebny and rebny_results is not None:
+            rebny_results[person.original_index] = lookup_rebny_from_members(person, rebny_members)
+
+        if run_fec and fec_results is not None:
+            fec_results[person.original_index] = lookup_fec(
                 person,
-                api_key,
-                cycles=cycles,
-                max_pages=max_pages,
-                false_positive_threshold=common_name_threshold,
+                api_key=api_key or "DEMO_KEY",
+                years=fec_years,
+                max_pages=5,
+                pause_seconds=0.1,
             )
-            row.update(fec.as_row())
-            if fec_delay:
-                time.sleep(fec_delay)
 
-        if run_rebny:
-            rebny = lookup_rebny(
-                person.first_name,
-                person.last_name,
-                polite_delay_seconds=rebny_delay,
-                use_playwright_fallback=True,
-            )
-            row.update(rebny.as_row())
-
-        rows.append(row)
-        progress.progress(index / total, text=f"{index}/{total} checked")
+        progress.progress(number / len(people))
 
     status.empty()
     progress.empty()
-    return pd.DataFrame(rows)
 
-
-if uploaded is not None:
-    try:
-        df = read_uploaded_file(uploaded)
-        people = people_from_dataframe(df)
-    except Exception as exc:
-        st.error(f"Could not read names: {exc}")
-        st.stop()
-
-    st.success(f"Loaded {len(people)} people.")
-    with st.expander("Preview parsed names", expanded=True):
-        st.dataframe(pd.DataFrame(people_preview_rows(people)), use_container_width=True, hide_index=True)
-
-    if not run_fec and not run_rebny:
-        st.warning("Select at least one check in the sidebar.")
-        st.stop()
-
-    st.markdown("### 2) Run vetting")
-    st.markdown(
-        "<p class='small-muted'>REBNY FOUND means the returned member name itself matched first+last tokens. Count-only directory responses are never marked as matches.</p>",
-        unsafe_allow_html=True,
+    out_df = build_results_dataframe(
+        source_df,
+        people,
+        column_map,
+        rebny_results=rebny_results,
+        fec_results=fec_results,
     )
 
-    if st.button("🔍 Run Vetting", type="primary", use_container_width=True):
-        out_df = run_checks(people)
+    summary = results_summary(people, rebny_results=rebny_results, fec_results=fec_results)
+    cols = st.columns(5)
+    cols[0].metric("Total checked", summary.get("total", 0))
+    if run_fec:
+        cols[1].metric("FEC flagged", summary.get("fec_flagged", 0))
+        cols[2].metric("FEC review", summary.get("fec_review", 0))
+    if run_rebny:
+        cols[3].metric("REBNY found", summary.get("rebny_found", 0))
+        cols[4].metric("REBNY review", summary.get("rebny_review", 0))
 
-        st.markdown("### 3) Summary")
-        cols = st.columns(5)
-        cols[0].metric("Total checked", len(out_df))
-        if run_fec:
-            fec_flagged = int(out_df["FEC Status"].astype(str).str.contains("FLAGGED", na=False).sum())
-            fec_review = int(out_df["FEC Status"].astype(str).str.contains("REVIEW", na=False).sum())
-            cols[1].metric("FEC flagged", fec_flagged)
-            cols[2].metric("FEC review", fec_review)
-        if run_rebny:
-            rebny_found = int((out_df["REBNY Status"].astype(str) == "FOUND").sum())
-            rebny_review = int((out_df["REBNY Status"].astype(str) == "review").sum())
-            cols[3].metric("REBNY found", rebny_found)
-            cols[4].metric("REBNY review", rebny_review)
+    st.subheader("Results")
+    st.dataframe(out_df, use_container_width=True, hide_index=True)
 
-        st.markdown("### Results")
-        st.dataframe(out_df, use_container_width=True, hide_index=True)
-
-        csv_bytes = out_df.to_csv(index=False).encode("utf-8")
-        xlsx_bytes = dataframe_to_excel_bytes(out_df)
-        left, right = st.columns(2)
-        left.download_button(
-            "⬇️ Download CSV",
-            data=csv_bytes,
-            file_name=f"{uploaded.name.rsplit('.', 1)[0]}_vetted.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        right.download_button(
-            "⬇️ Download Excel",
-            data=xlsx_bytes,
-            file_name=f"{uploaded.name.rsplit('.', 1)[0]}_vetted.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            type="primary",
-        )
-else:
-    st.markdown("### What changed")
-    st.markdown(
-        """
-- **REBNY is now card/name based, not count based.** A page saying “1 Members” is not enough; the app extracts candidate names and checks them against the searched person.
-- **Ambiguous REBNY results go to review.** Initial-only or fuzzy matches are not silently treated as confirmed members.
-- **FEC now paginates.** The old version only looked at the first 100 records.
-- **FEC donor names are re-filtered locally.** This reduces false positives from broad FEC contributor-name search.
-- **The Republican classifier is stricter.** Generic issue terms were removed from the Republican keyword list.
-"""
+    xlsx_bytes = dataframe_to_xlsx_bytes(out_df)
+    output_name = Path(uploaded.name).stem + "_vetted.xlsx"
+    st.download_button(
+        "Download vetted spreadsheet",
+        data=xlsx_bytes,
+        file_name=output_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
     )
