@@ -5,6 +5,11 @@ import time
 import io
 import re
 from openpyxl import load_workbook, Workbook
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
 
@@ -127,17 +132,6 @@ REPUBLICAN_COMMITTEE_KEYWORDS = [
     "congressional leadership fund", "senate leadership fund", "israel"
 ]
 
-REBNY_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.rebny.com/members/",
-}
-
 def is_republican_recipient(committee_name: str, party: str) -> bool:
     if party and party.upper() in REPUBLICAN_PARTY_CODES:
         return True
@@ -151,11 +145,12 @@ def is_republican_recipient(committee_name: str, party: str) -> bool:
 def lookup_rebny(first_name: str, last_name: str) -> dict:
     """
     Check whether a person appears in the REBNY member directory.
+    Uses Playwright (headless Chromium) because the directory is JS-rendered
+    and a plain HTTP request only returns the empty page shell.
 
-    Strategy:
-    1. Try the public-facing search page (renders member count in HTML).
-    2. Parse the result count / any listed names from the page.
-    3. Return a structured dict regardless of outcome.
+    Install requirements:
+        pip install playwright
+        playwright install chromium
     """
     default = {
         "rebny_status": "unknown",
@@ -163,25 +158,36 @@ def lookup_rebny(first_name: str, last_name: str) -> dict:
         "rebny_detail": "Could not reach REBNY",
     }
 
+    if not PLAYWRIGHT_AVAILABLE:
+        default["rebny_status"] = "unavailable"
+        default["rebny_detail"] = "playwright not installed — run: pip install playwright && playwright install chromium"
+        return default
+
     query = f"{first_name} {last_name}"
-    url = "https://www.rebny.com/members/"
+    url = f"https://www.rebny.com/members/?search={requests.utils.quote(query)}"
 
     try:
-        resp = requests.get(
-            url,
-            params={"search": query},
-            headers=REBNY_HEADERS,
-            timeout=12,
-        )
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
 
-        if resp.status_code != 200:
-            default["rebny_detail"] = f"HTTP {resp.status_code}"
-            return default
+            # Wait for network to settle so JS-rendered results are present
+            page.goto(url, wait_until="networkidle", timeout=25000)
 
-        html = resp.text
+            # Extra wait: poll until the result count element appears or
+            # "No Search Results Found" text is visible (max 8 s)
+            try:
+                page.wait_for_selector(
+                    "text=/\\d+ Members|No Search Results Found/",
+                    timeout=8000,
+                )
+            except Exception:
+                pass  # proceed and parse whatever is there
 
-        # ── Attempt 1: look for "N Members" count string ──────────────────────
-        # REBNY renders something like "<strong>1</strong> Members" or "1 Members"
+            html = page.content()
+            browser.close()
+
+        # ── Parse count: "3 Members" / "1 Members" / "0 Members" ─────────────
         count_match = re.search(r'(\d+)\s*Members', html)
         if count_match:
             count = int(count_match.group(1))
@@ -191,14 +197,24 @@ def lookup_rebny(first_name: str, last_name: str) -> dict:
                     "rebny_match": False,
                     "rebny_detail": "Not in REBNY directory",
                 }
-            else:
-                return {
-                    "rebny_status": "FOUND",
-                    "rebny_match": True,
-                    "rebny_detail": f"{count} result(s) found in REBNY directory",
-                }
 
-        # ── Attempt 2: look for "No Search Results Found" sentinel ────────────
+            # Try to pull the first listed name from the rendered cards
+            # REBNY member cards typically have the name in an <h2> or <h3>
+            name_match = re.search(
+                r'<(?:h2|h3|p)[^>]*class="[^"]*(?:name|title|member)[^"]*"[^>]*>\s*([^<]{3,60})\s*</',
+                html, re.IGNORECASE
+            )
+            listed = name_match.group(1).strip() if name_match else ""
+            detail = f"{count} result(s) found in REBNY directory"
+            if listed:
+                detail += f" — e.g. {listed}"
+            return {
+                "rebny_status": "FOUND",
+                "rebny_match": True,
+                "rebny_detail": detail,
+            }
+
+        # ── Explicit "no results" sentinel ────────────────────────────────────
         if "No Search Results Found" in html:
             return {
                 "rebny_status": "not found",
@@ -206,25 +222,13 @@ def lookup_rebny(first_name: str, last_name: str) -> dict:
                 "rebny_detail": "Not in REBNY directory",
             }
 
-        # ── Attempt 3: look for member card patterns in raw HTML ──────────────
-        member_hits = len(re.findall(r'data-member|class="[^"]*member-card|class="[^"]*directory-result', html, re.IGNORECASE))
-        if member_hits > 0:
-            return {
-                "rebny_status": "FOUND",
-                "rebny_match": True,
-                "rebny_detail": f"Member card(s) detected in REBNY directory",
-            }
-
         # ── Fallback ──────────────────────────────────────────────────────────
         default["rebny_status"] = "parse error"
-        default["rebny_detail"] = "Page loaded but result unclear — check manually"
+        default["rebny_detail"] = "Page loaded but result unclear — check manually at rebny.com/members"
         return default
 
-    except requests.exceptions.Timeout:
-        default["rebny_detail"] = "REBNY request timed out"
-        return default
     except Exception as e:
-        default["rebny_detail"] = str(e)
+        default["rebny_detail"] = f"Error: {e}"
         return default
 
 
