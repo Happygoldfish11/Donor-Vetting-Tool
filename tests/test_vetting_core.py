@@ -1,85 +1,40 @@
 import pandas as pd
 
-from vetting_core import (
-    Person,
-    RebnyMember,
-    find_column,
-    is_republican_recipient,
-    load_rebny_members,
-    lookup_rebny_from_members,
-    name_tokens,
-    people_from_dataframe,
-    score_rebny_member,
-)
+from vetting_core import Person, RebnyCache, normalize_name, people_from_dataframe, is_republican_recipient
 
 
-def test_people_from_dataframe_accepts_common_columns():
-    df = pd.DataFrame(
-        {
-            "First Name": ["Jane"],
-            "Last Name": ["Doe"],
-            "State": ["NY"],
-            "Zip Code": ["10001-1234"],
-        }
-    )
-    people, mapping = people_from_dataframe(df)
-    assert len(people) == 1
-    assert people[0].first_name == "Jane"
-    assert people[0].last_name == "Doe"
-    assert people[0].zip_code == "10001"
-    assert mapping["first"] == "First Name"
+def test_normalize_name():
+    assert normalize_name(" Jane A. Doe, Jr. ") == "jane a doe"
 
 
-def test_name_tokens_remove_suffixes():
-    assert name_tokens("John Q. Public Jr.") == ["john", "q", "public"]
+def test_people_from_dataframe():
+    df = pd.DataFrame({"First Name": ["Jane"], "Last Name": ["Doe"], "State": ["NY"]})
+    people = people_from_dataframe(df)
+    assert people == [Person("Jane", "Doe", "NY", "")]
 
 
-def test_rebny_exact_match_found():
-    person = Person("Jane", "Doe")
-    member = RebnyMember(name="Jane A. Doe", company="Example Realty")
-    result = lookup_rebny_from_members(person, [member])
-    assert result.found is True
-    assert result.result == "FOUND"
-    assert result.match_name == "Jane A. Doe"
+def test_rebny_exact_match():
+    cache = RebnyCache([{"name": "Jane Doe", "company": "Example Realty", "category": "Residential - Brokerage"}])
+    m = cache.match_person(Person("Jane", "Doe"))
+    assert m.matched is True
+    assert m.status == "FOUND"
+    assert m.review is False
 
 
-def test_rebny_initial_match_review():
-    person = Person("Jane", "Doe")
-    member = RebnyMember(name="J. Doe", company="Example Realty")
-    result = lookup_rebny_from_members(person, [member])
-    assert result.found is False
-    assert result.review is True
-    assert result.result == "REVIEW"
+def test_rebny_initial_review():
+    cache = RebnyCache([{"name": "J. Doe", "company": "Example Realty"}])
+    m = cache.match_person(Person("Jane", "Doe"))
+    assert m.status == "REVIEW"
+    assert m.review is True
 
 
-def test_rebny_not_found_clean():
-    person = Person("Jane", "Doe")
-    member = RebnyMember(name="Alice Smith", company="Example Realty")
-    result = lookup_rebny_from_members(person, [member])
-    assert result.found is False
-    assert result.review is False
-    assert result.result == "Clean"
+def test_rebny_not_found():
+    cache = RebnyCache([{"name": "Other Person"}])
+    m = cache.match_person(Person("Jane", "Doe"))
+    assert m.status == "not found"
 
 
-def test_rebny_missing_cache_review():
-    result = lookup_rebny_from_members(Person("Jane", "Doe"), [])
-    assert result.review is True
-    assert result.result == "REVIEW"
-
-
-def test_republican_committee_detection():
-    assert is_republican_recipient("Republican National Committee") is True
-    assert is_republican_recipient("WinRed", "REP") is True
-    assert is_republican_recipient("Friends of Public Schools", "DEM") is False
-
-
-def test_load_rebny_members_from_file_like(tmp_path):
-    path = tmp_path / "rebny_members.xlsx"
-    pd.DataFrame({"name": ["Jane Doe"], "company": ["Example Realty"]}).to_excel(path, index=False)
-    members = load_rebny_members(path)
-    assert len(members) == 1
-    assert members[0].display_name == "Jane Doe"
-
-
-def test_find_column_fuzzy_alias():
-    assert find_column(["Given Name", "Family Name"], ["first name", "given"]) == "Given Name"
+def test_republican_recipient():
+    assert is_republican_recipient("National Republican Senatorial Committee", "")
+    assert is_republican_recipient("Some Committee", "REP")
+    assert not is_republican_recipient("Generic Israel Education Fund", "")

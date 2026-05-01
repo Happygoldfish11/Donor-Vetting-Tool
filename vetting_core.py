@@ -1,710 +1,348 @@
 from __future__ import annotations
 
-import io
-import math
-import re
-import time
-import unicodedata
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Iterable, Optional
+import io
+import re
+import unicodedata
 
 import pandas as pd
 import requests
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
-
-DEFAULT_REBNY_CACHE_PATH = Path("data/rebny_members.xlsx")
-DEFAULT_FEC_YEARS = [2026, 2024, 2022]
-FEC_API_URL = "https://api.open.fec.gov/v1/schedules/schedule_a/"
-
-FIRST_NAME_ALIASES = ["first name", "firstname", "first", "given name", "given"]
-LAST_NAME_ALIASES = ["last name", "lastname", "last", "surname", "family name", "family"]
-STATE_ALIASES = ["state", "st"]
-ZIP_ALIASES = ["zip", "zipcode", "zip code", "postal", "postal code"]
-
-REBNY_NAME_ALIASES = [
-    "name",
-    "member name",
-    "full name",
-    "fullname",
-    "person",
-    "member",
-    "contact",
-]
-REBNY_COMPANY_ALIASES = ["company", "firm", "organization", "org", "brokerage", "office"]
-REBNY_TITLE_ALIASES = ["title", "role", "position", "job title"]
-REBNY_URL_ALIASES = ["url", "profile", "profile url", "link", "source url"]
 
 NAME_SUFFIXES = {
-    "jr",
-    "sr",
-    "ii",
-    "iii",
-    "iv",
-    "v",
-    "vi",
-    "esq",
-    "phd",
-    "md",
-    "mba",
-    "cpa",
+    "jr", "sr", "ii", "iii", "iv", "v", "esq", "esquire", "cpa", "pe", "phd", "md"
 }
 
-REPUBLICAN_PARTY_CODES = {"REP", "R"}
-REPUBLICAN_COMMITTEE_TERMS = [
-    "republican",
-    "gop",
-    "rnc",
-    "nrcc",
-    "nrsc",
-    "maga",
-    "make america great again",
-    "trump",
-    "desantis",
-    "haley for president",
-    "ted cruz",
-    "cruz for",
-    "cotton for",
-    "tim scott",
-    "mike pence",
-    "right to rise",
-    "club for growth",
-    "freedomworks",
-    "freedom works",
-    "heritage action",
-    "tea party",
-    "american crossroads",
-    "crossroads gps",
-    "congressional leadership fund",
-    "senate leadership fund",
-    "conservative victory",
-    "conservative pac",
-]
+REPUBLICAN_PARTY_CODES = {"REP"}
+REPUBLICAN_COMMITTEE_TERMS = {
+    "republican", "rnc", "nrcc", "nrsc", "gop", "maga", "trump",
+    "america first", "conservative", "right to rise", "tea party",
+    "club for growth", "freedomworks", "heritage action", "citizens united",
+    "american crossroads", "congressional leadership fund", "senate leadership fund",
+}
 
-
-@dataclass(slots=True)
+@dataclass(frozen=True)
 class Person:
     first_name: str
     last_name: str
     state: str = ""
     zip_code: str = ""
-    original_index: int = 0
 
     @property
     def full_name(self) -> str:
         return f"{self.first_name} {self.last_name}".strip()
 
-
-@dataclass(slots=True)
-class RebnyMember:
-    name: str
-    first_name: str = ""
-    last_name: str = ""
-    company: str = ""
-    title: str = ""
-    profile_url: str = ""
-    raw_text: str = ""
-
-    @property
-    def display_name(self) -> str:
-        return self.name or f"{self.first_name} {self.last_name}".strip()
-
-
-@dataclass(slots=True)
-class RebnyResult:
+@dataclass(frozen=True)
+class RebnyMatch:
     status: str
-    result: str
-    found: bool
     review: bool
-    match_name: str = ""
+    matched: bool
+    matched_name: str = ""
     company: str = ""
-    score: int = 0
+    category: str = ""
+    score: float = 0.0
     detail: str = ""
 
-    def as_row(self) -> dict[str, Any]:
+    def as_row(self) -> dict:
         return {
             "REBNY Status": self.status,
-            "REBNY Result": self.result,
-            "REBNY Match Name": self.match_name,
+            "REBNY Review": "YES" if self.review else "",
+            "REBNY Matched Name": self.matched_name,
             "REBNY Company": self.company,
-            "REBNY Score": self.score,
+            "REBNY Category": self.category,
+            "REBNY Score": round(self.score, 3),
             "REBNY Detail": self.detail,
         }
 
-
-@dataclass(slots=True)
-class FecResult:
+@dataclass(frozen=True)
+class FecMatch:
     status: str
-    result: str
-    flagged: bool
     review: bool
-    republican_total: float = 0.0
-    republican_count: int = 0
+    flagged: bool
     total_records: int = 0
-    top_recipients: str = ""
+    republican_records: int = 0
+    republican_total: float = 0.0
+    recipients: str = ""
     detail: str = ""
 
-    def as_row(self) -> dict[str, Any]:
+    def as_row(self) -> dict:
+        label = "FLAGGED" if self.flagged else "CLEAR"
+        if self.review and self.flagged:
+            label = "FLAGGED - REVIEW"
+        elif self.review:
+            label = "REVIEW"
+        if self.status != "ok":
+            label = self.status.upper()
         return {
-            "FEC Status": self.status,
-            "FEC Result": self.result,
-            "GOP Donations ($)": round(self.republican_total, 2),
-            "GOP Donation Count": self.republican_count,
-            "FEC Records Checked": self.total_records,
-            "Top GOP Recipients": self.top_recipients,
+            "FEC Status": label,
+            "FEC Review": "YES" if self.review else "",
+            "GOP Donations ($)": self.republican_total if self.flagged else 0,
+            "GOP Donation Count": self.republican_records,
+            "FEC Records Found": self.total_records,
+            "FEC Recipients": self.recipients,
             "FEC Detail": self.detail,
         }
 
+class RebnyCache:
+    def __init__(self, records: Iterable[dict]):
+        self.records: list[dict] = []
+        for raw in records:
+            name = clean_cell(raw.get("name") or raw.get("full_name") or raw.get("member_name") or "")
+            first = clean_cell(raw.get("first_name") or "")
+            last = clean_cell(raw.get("last_name") or "")
+            if not name and (first or last):
+                name = f"{first} {last}".strip()
+            if not name:
+                continue
+            first2, last2 = split_name(name)
+            if not first:
+                first = first2
+            if not last:
+                last = last2
+            row = {
+                "name": name,
+                "first_name": first,
+                "last_name": last,
+                "company": clean_cell(raw.get("company") or raw.get("organization") or raw.get("firm") or ""),
+                "category": clean_cell(raw.get("category") or raw.get("member_type") or raw.get("membership_type") or raw.get("division") or ""),
+                "source_query": clean_cell(raw.get("source_query") or ""),
+                "source_url": clean_cell(raw.get("source_url") or ""),
+                "raw_text": clean_cell(raw.get("raw_text") or ""),
+            }
+            row["norm_name"] = normalize_name(name)
+            row["norm_first"] = normalize_name(first)
+            row["norm_last"] = normalize_name(last)
+            self.records.append(row)
 
-def clean_scalar(value: Any) -> str:
+    @classmethod
+    def from_file(cls, file_or_path) -> "RebnyCache":
+        df = read_table(file_or_path)
+        df = normalize_columns(df)
+        if "name" not in df.columns and not ({"first_name", "last_name"} <= set(df.columns)):
+            name_col = guess_column(df.columns, ["member", "full_name", "full name", "name"])
+            if name_col:
+                df = df.rename(columns={name_col: "name"})
+        mappings = {
+            "first": "first_name", "firstname": "first_name", "first_name": "first_name", "first name": "first_name",
+            "last": "last_name", "lastname": "last_name", "last_name": "last_name", "last name": "last_name",
+            "member": "name", "member_name": "name", "member name": "name", "full name": "name", "full_name": "name",
+            "organization": "company", "firm": "company", "company name": "company", "company_name": "company",
+            "member type": "category", "membership type": "category", "division": "category",
+        }
+        df = df.rename(columns={c: mappings[c] for c in df.columns if c in mappings})
+        return cls(df.fillna("").to_dict(orient="records"))
+
+    def match_person(self, person: Person) -> RebnyMatch:
+        target_first = normalize_name(person.first_name)
+        target_last = normalize_name(person.last_name)
+        target_full = normalize_name(person.full_name)
+        if not target_first or not target_last:
+            return RebnyMatch("error", True, False, detail="missing first or last name")
+        best: Optional[dict] = None
+        best_score = 0.0
+        best_reason = ""
+        for r in self.records:
+            score, reason = score_name_match(target_first, target_last, target_full, r)
+            if score > best_score:
+                best_score, best, best_reason = score, r, reason
+        if not best:
+            return RebnyMatch("not found", False, False, detail="no cache record matched")
+        if best_score >= 1.0:
+            return RebnyMatch("FOUND", False, True, best["name"], best["company"], best["category"], best_score, best_reason)
+        if best_score >= 0.78:
+            return RebnyMatch("REVIEW", True, False, best["name"], best["company"], best["category"], best_score, best_reason)
+        return RebnyMatch("not found", False, False, best["name"], best["company"], best["category"], best_score, "below match threshold")
+
+    def to_dataframe(self) -> pd.DataFrame:
+        cols = ["name", "first_name", "last_name", "company", "category", "source_query", "source_url", "raw_text"]
+        return pd.DataFrame([{c: r.get(c, "") for c in cols} for r in self.records])
+
+
+def clean_cell(value) -> str:
     if value is None:
         return ""
-    if isinstance(value, float) and math.isnan(value):
-        return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "null"}:
-        return ""
-    return text
+    value = str(value).replace("\xa0", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
 
-def ascii_fold(text: str) -> str:
-    text = unicodedata.normalize("NFKD", clean_scalar(text))
-    return "".join(ch for ch in text if not unicodedata.combining(ch))
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [re.sub(r"\s+", "_", str(c).strip().lower()) for c in out.columns]
+    return out
 
 
-def normalize_text(text: str) -> str:
-    text = ascii_fold(text).lower()
-    text = text.replace("&", " and ")
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+def guess_column(columns, needles) -> str:
+    for n in needles:
+        n2 = n.replace(" ", "_")
+        for c in columns:
+            if n2 == c or n2 in c:
+                return c
+    return ""
 
 
-def name_tokens(text: str) -> list[str]:
-    tokens = normalize_text(text).split()
-    return [token for token in tokens if token and token not in NAME_SUFFIXES]
-
-
-def normalize_zip(value: Any) -> str:
-    text = clean_scalar(value)
-    digits = re.sub(r"\D", "", text)
-    return digits[:5]
-
-
-def canonical_col(col: Any) -> str:
-    return normalize_text(str(col))
-
-
-def find_column(columns: Iterable[Any], aliases: Iterable[str]) -> Optional[Any]:
-    alias_set = {canonical_col(alias) for alias in aliases}
-    normalized = {col: canonical_col(col) for col in columns}
-
-    for col, canon in normalized.items():
-        if canon in alias_set:
-            return col
-
-    for col, canon in normalized.items():
-        if any(alias in canon for alias in alias_set):
-            return col
-
-    return None
-
-
-def read_spreadsheet(file_or_path: Any) -> pd.DataFrame:
+def read_table(file_or_path) -> pd.DataFrame:
     name = getattr(file_or_path, "name", str(file_or_path)).lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file_or_path)
-    return pd.read_excel(file_or_path)
+    if isinstance(file_or_path, (str, Path)):
+        path = Path(file_or_path)
+        if path.suffix.lower() in {".xlsx", ".xlsm", ".xls"}:
+            return pd.read_excel(path)
+        return pd.read_csv(path)
+    data = file_or_path.getvalue() if hasattr(file_or_path, "getvalue") else file_or_path.read()
+    bio = io.BytesIO(data)
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        return pd.read_excel(bio)
+    return pd.read_csv(bio)
 
 
-def people_from_dataframe(df: pd.DataFrame) -> tuple[list[Person], dict[str, Any]]:
-    first_col = find_column(df.columns, FIRST_NAME_ALIASES)
-    last_col = find_column(df.columns, LAST_NAME_ALIASES)
-    state_col = find_column(df.columns, STATE_ALIASES)
-    zip_col = find_column(df.columns, ZIP_ALIASES)
+def normalize_name(value: str) -> str:
+    value = clean_cell(value).lower()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.replace("&", " and ")
+    value = re.sub(r"[^a-z0-9\s'-]", " ", value)
+    value = value.replace("'", "")
+    value = re.sub(r"\s+", " ", value).strip()
+    tokens = [t for t in value.split() if t not in NAME_SUFFIXES]
+    return " ".join(tokens)
 
-    if first_col is None or last_col is None:
-        raise ValueError("Your file needs First Name and Last Name columns.")
 
-    people: list[Person] = []
-    for idx, row in df.iterrows():
-        first = clean_scalar(row.get(first_col, ""))
-        last = clean_scalar(row.get(last_col, ""))
+def split_name(full_name: str) -> tuple[str, str]:
+    n = clean_cell(full_name)
+    if not n:
+        return "", ""
+    if "," in n:
+        left, right = [x.strip() for x in n.split(",", 1)]
+        first = right.split()[0] if right else ""
+        last = left.split()[0] if left else ""
+        return first, last
+    parts = n.split()
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], parts[-1]
+
+
+def score_name_match(target_first: str, target_last: str, target_full: str, record: dict) -> tuple[float, str]:
+    rn = record.get("norm_name", "")
+    rf = record.get("norm_first", "")
+    rl = record.get("norm_last", "")
+    if rn == target_full:
+        return 1.0, "exact full-name match"
+    if rf == target_first and rl == target_last:
+        return 1.0, "exact first/last match"
+    rtokens = set(rn.split())
+    ttokens = set(target_full.split())
+    if target_first in rtokens and target_last in rtokens:
+        return 0.96, "first and last tokens present"
+    if rl == target_last and rf and target_first and rf[0] == target_first[0]:
+        return 0.84, "same last name and first initial"
+    if target_last in rtokens and target_first and any(t.startswith(target_first[:3]) for t in rtokens if len(target_first) >= 3):
+        return 0.82, "same last name and partial first name"
+    overlap = len(ttokens & rtokens) / max(1, len(ttokens | rtokens))
+    return overlap, "token overlap"
+
+
+def people_from_dataframe(df: pd.DataFrame) -> list[Person]:
+    df = normalize_columns(df)
+    first_col = guess_column(df.columns, ["first_name", "first", "firstname"])
+    last_col = guess_column(df.columns, ["last_name", "last", "lastname"])
+    state_col = guess_column(df.columns, ["state", "st"])
+    zip_col = guess_column(df.columns, ["zip_code", "zipcode", "zip", "postal"])
+    if not first_col or not last_col:
+        raise ValueError("Spreadsheet needs First Name and Last Name columns.")
+    people = []
+    for _, row in df.iterrows():
+        first = clean_cell(row.get(first_col, ""))
+        last = clean_cell(row.get(last_col, ""))
         if not first and not last:
             continue
-        people.append(
-            Person(
-                first_name=first,
-                last_name=last,
-                state=clean_scalar(row.get(state_col, "")) if state_col is not None else "",
-                zip_code=normalize_zip(row.get(zip_col, "")) if zip_col is not None else "",
-                original_index=int(idx),
-            )
-        )
-
-    return people, {
-        "first": first_col,
-        "last": last_col,
-        "state": state_col,
-        "zip": zip_col,
-    }
+        people.append(Person(
+            first_name=first,
+            last_name=last,
+            state=clean_cell(row.get(state_col, "")) if state_col else "",
+            zip_code=clean_cell(row.get(zip_col, "")) if zip_col else "",
+        ))
+    return people
 
 
-def people_preview_rows(people: list[Person], limit: int = 10) -> pd.DataFrame:
-    rows = [
-        {
-            "First Name": person.first_name,
-            "Last Name": person.last_name,
-            "State": person.state,
-            "Zip": person.zip_code,
-        }
-        for person in people[:limit]
-    ]
-    return pd.DataFrame(rows)
-
-
-def member_from_row(row: pd.Series, columns: Iterable[Any]) -> RebnyMember:
-    name_col = find_column(columns, REBNY_NAME_ALIASES)
-    first_col = find_column(columns, FIRST_NAME_ALIASES)
-    last_col = find_column(columns, LAST_NAME_ALIASES)
-    company_col = find_column(columns, REBNY_COMPANY_ALIASES)
-    title_col = find_column(columns, REBNY_TITLE_ALIASES)
-    url_col = find_column(columns, REBNY_URL_ALIASES)
-
-    first = clean_scalar(row.get(first_col, "")) if first_col is not None else ""
-    last = clean_scalar(row.get(last_col, "")) if last_col is not None else ""
-    name = clean_scalar(row.get(name_col, "")) if name_col is not None else ""
-    if not name:
-        name = f"{first} {last}".strip()
-
-    return RebnyMember(
-        name=name,
-        first_name=first,
-        last_name=last,
-        company=clean_scalar(row.get(company_col, "")) if company_col is not None else "",
-        title=clean_scalar(row.get(title_col, "")) if title_col is not None else "",
-        profile_url=clean_scalar(row.get(url_col, "")) if url_col is not None else "",
-        raw_text=" | ".join(clean_scalar(row.get(col, "")) for col in columns if clean_scalar(row.get(col, ""))),
-    )
-
-
-def load_rebny_members(file_or_path: Any = DEFAULT_REBNY_CACHE_PATH) -> list[RebnyMember]:
-    if isinstance(file_or_path, (str, Path)) and not Path(file_or_path).exists():
-        return []
-
-    df = read_spreadsheet(file_or_path)
-    if df.empty:
-        return []
-
-    members: list[RebnyMember] = []
-    for _, row in df.iterrows():
-        member = member_from_row(row, df.columns)
-        if member.display_name:
-            members.append(member)
-    return dedupe_members(members)
-
-
-def dedupe_members(members: Iterable[RebnyMember]) -> list[RebnyMember]:
-    seen: set[tuple[str, str]] = set()
-    unique: list[RebnyMember] = []
-    for member in members:
-        key = (normalize_text(member.display_name), normalize_text(member.company))
-        if not key[0] or key in seen:
-            continue
-        seen.add(key)
-        unique.append(member)
-    return unique
-
-
-def parse_member_name(member: RebnyMember) -> tuple[str, str, list[str]]:
-    first = normalize_text(member.first_name)
-    last = normalize_text(member.last_name)
-    tokens = name_tokens(member.display_name)
-
-    if not first and tokens:
-        first = tokens[0]
-    if not last and len(tokens) >= 2:
-        last = tokens[-1]
-    return first, last, tokens
-
-
-def score_rebny_member(person: Person, member: RebnyMember) -> tuple[int, str]:
-    query_first = normalize_text(person.first_name)
-    query_last = normalize_text(person.last_name)
-    member_first, member_last, tokens = parse_member_name(member)
-    member_full = normalize_text(member.display_name)
-    query_full = normalize_text(person.full_name)
-
-    if not query_first or not query_last or not member_full:
-        return 0, "missing name data"
-
-    if member_first == query_first and member_last == query_last:
-        return 100, "first and last name exact match"
-
-    if query_first in tokens and query_last in tokens:
-        return 98, "first and last tokens found in member name"
-
-    if member_last == query_last and member_first == query_first:
-        return 96, "normalized first and last match"
-
-    if member_last == query_last and member_first and query_first and member_first[0] == query_first[0]:
-        return 82, "same last name and first initial"
-
-    if member_last == query_last and SequenceMatcher(None, member_first, query_first).ratio() >= 0.87:
-        return 80, "same last name and similar first name"
-
-    if SequenceMatcher(None, member_full, query_full).ratio() >= 0.94:
-        return 78, "very similar full name"
-
-    if member_last == query_last:
-        return 55, "same last name only"
-
-    return 0, "no meaningful name match"
-
-
-def lookup_rebny_from_members(person: Person, members: list[RebnyMember]) -> RebnyResult:
-    if not members:
-        return RebnyResult(
-            status="cache missing",
-            result="REVIEW",
-            found=False,
-            review=True,
-            detail="No REBNY cache loaded. Add data/rebny_members.xlsx or upload a REBNY cache file.",
-        )
-
-    scored: list[tuple[int, str, RebnyMember]] = []
-    for member in members:
-        score, reason = score_rebny_member(person, member)
-        if score >= 55:
-            scored.append((score, reason, member))
-
-    if not scored:
-        return RebnyResult(
-            status="not found",
-            result="Clean",
-            found=False,
-            review=False,
-            detail="No local REBNY cache match.",
-        )
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    best_score, reason, best = scored[0]
-    display = best.display_name
-
-    if best_score >= 96:
-        return RebnyResult(
-            status="found",
-            result="FOUND",
-            found=True,
-            review=False,
-            match_name=display,
-            company=best.company,
-            score=best_score,
-            detail=reason,
-        )
-
-    if best_score >= 78:
-        return RebnyResult(
-            status="possible match",
-            result="REVIEW",
-            found=False,
-            review=True,
-            match_name=display,
-            company=best.company,
-            score=best_score,
-            detail=f"Possible REBNY match: {reason}",
-        )
-
-    nearby = ", ".join(member.display_name for _, _, member in scored[:3])
-    return RebnyResult(
-        status="same last name",
-        result="REVIEW",
-        found=False,
-        review=True,
-        match_name=display,
-        company=best.company,
-        score=best_score,
-        detail=f"Same-last-name cache hit(s), verify manually: {nearby}",
-    )
-
-
-def is_republican_recipient(committee_name: str, party: str = "") -> bool:
-    party_norm = normalize_text(party).upper()
-    if party_norm in REPUBLICAN_PARTY_CODES:
+def is_republican_recipient(committee_name: str, party: str) -> bool:
+    if party and party.upper() in REPUBLICAN_PARTY_CODES:
         return True
-
-    committee_norm = normalize_text(committee_name)
-    if not committee_norm:
-        return False
-    return any(term in committee_norm for term in REPUBLICAN_COMMITTEE_TERMS)
+    name = normalize_name(committee_name)
+    return any(term in name for term in REPUBLICAN_COMMITTEE_TERMS)
 
 
-def fec_record_matches_person(record: dict[str, Any], person: Person) -> bool:
-    record_name = normalize_text(record.get("contributor_name", ""))
-    first = normalize_text(person.first_name)
-    last = normalize_text(person.last_name)
-    if first and first not in record_name:
-        return False
-    if last and last not in record_name:
-        return False
-
-    if person.state:
-        record_state = normalize_text(record.get("contributor_state", ""))
-        if record_state and normalize_text(person.state) != record_state:
-            return False
-
-    if person.zip_code:
-        record_zip = normalize_zip(record.get("contributor_zip", ""))
-        if record_zip and person.zip_code != record_zip:
-            return False
-
-    return True
-
-
-def committee_name_and_party(record: dict[str, Any]) -> tuple[str, str]:
-    committee = record.get("committee") or {}
-    if not isinstance(committee, dict):
-        committee = {}
-    committee_name = (
-        clean_scalar(record.get("committee_name"))
-        or clean_scalar(committee.get("name"))
-        or clean_scalar(record.get("committee", ""))
-    )
-    party = (
-        clean_scalar(record.get("committee_party"))
-        or clean_scalar(record.get("recipient_committee_party"))
-        or clean_scalar(committee.get("party"))
-        or clean_scalar(committee.get("party_full"))
-    )
-    return committee_name, party
-
-
-def lookup_fec(
-    person: Person,
-    api_key: str,
-    years: Iterable[int] = DEFAULT_FEC_YEARS,
-    max_pages: int = 5,
-    pause_seconds: float = 0.1,
-    session: Optional[requests.Session] = None,
-) -> FecResult:
+def lookup_fec(person: Person, api_key: str, cycles=(2026, 2024, 2022, 2020), max_pages: int = 3) -> FecMatch:
     if not api_key:
-        api_key = "DEMO_KEY"
-
-    http = session or requests.Session()
-    base_params: dict[str, Any] = {
-        "api_key": api_key,
-        "contributor_name": f"{person.last_name}, {person.first_name}",
-        "two_year_transaction_period": list(years),
-        "per_page": 100,
-        "sort": "-contribution_receipt_date",
-    }
-    if person.state:
-        base_params["contributor_state"] = person.state.upper().strip()
-    if person.zip_code:
-        base_params["contributor_zip"] = person.zip_code
-
-    records_checked = 0
-    republican_donations: list[dict[str, Any]] = []
-
+        return FecMatch("skipped", False, False, detail="no FEC API key provided")
+    name_query = f"{person.last_name}, {person.first_name}".upper()
+    url = "https://api.open.fec.gov/v1/schedules/schedule_a/"
+    results = []
+    page = 1
     try:
-        for page in range(1, max_pages + 1):
-            params = dict(base_params)
-            params["page"] = page
-            response = http.get(FEC_API_URL, params=params, timeout=20)
-
-            if response.status_code == 429:
-                return FecResult(
-                    status="rate limited",
-                    result="REVIEW",
-                    flagged=False,
-                    review=True,
-                    total_records=records_checked,
-                    detail="FEC rate limit hit. Try again later or use a personal OpenFEC API key.",
-                )
-            if response.status_code != 200:
-                return FecResult(
-                    status="error",
-                    result="REVIEW",
-                    flagged=False,
-                    review=True,
-                    total_records=records_checked,
-                    detail=f"FEC returned HTTP {response.status_code}.",
-                )
-
-            payload = response.json()
-            results = payload.get("results", [])
-            if not results:
-                break
-
-            for record in results:
-                if not fec_record_matches_person(record, person):
-                    continue
-                records_checked += 1
-                committee_name, party = committee_name_and_party(record)
-                if is_republican_recipient(committee_name, party):
-                    republican_donations.append(
-                        {
-                            "committee": committee_name,
-                            "amount": float(record.get("contribution_receipt_amount") or 0),
-                            "date": clean_scalar(record.get("contribution_receipt_date")),
-                            "party": party,
-                        }
-                    )
-
-            pagination = payload.get("pagination", {}) or {}
-            pages = int(pagination.get("pages", page) or page)
+        while page <= max_pages:
+            params = {
+                "api_key": api_key,
+                "contributor_name": name_query,
+                "two_year_transaction_period": list(cycles),
+                "per_page": 100,
+                "page": page,
+                "sort": "-contribution_receipt_date",
+            }
+            if person.state:
+                params["contributor_state"] = person.state.upper()
+            resp = requests.get(url, params=params, timeout=20)
+            if resp.status_code == 429:
+                return FecMatch("rate_limited", True, False, detail="FEC API rate limit")
+            if resp.status_code != 200:
+                return FecMatch("error", True, False, detail=f"FEC HTTP {resp.status_code}")
+            payload = resp.json()
+            batch = payload.get("results", [])
+            results.extend(batch)
+            pages = int(payload.get("pagination", {}).get("pages") or page)
             if page >= pages:
                 break
-            if pause_seconds:
-                time.sleep(pause_seconds)
-
-    except requests.exceptions.Timeout:
-        return FecResult(
-            status="timeout",
-            result="REVIEW",
-            flagged=False,
-            review=True,
-            total_records=records_checked,
-            detail="FEC request timed out.",
-        )
+            page += 1
     except Exception as exc:
-        return FecResult(
-            status="error",
-            result="REVIEW",
-            flagged=False,
-            review=True,
-            total_records=records_checked,
-            detail=f"FEC lookup failed: {exc}",
-        )
+        return FecMatch("error", True, False, detail=str(exc))
 
-    if not republican_donations:
-        if records_checked >= 25 and not (person.state or person.zip_code):
-            return FecResult(
-                status="common name",
-                result="REVIEW",
-                flagged=False,
-                review=True,
-                total_records=records_checked,
-                detail="Many FEC records matched this name. Add State or Zip to reduce false positives.",
-            )
-        return FecResult(
-            status="clean",
-            result="Clean",
-            flagged=False,
-            review=False,
-            total_records=records_checked,
-            detail="No Republican recipient matches found in checked FEC records.",
-        )
-
-    total = sum(donation["amount"] for donation in republican_donations)
-    committees: list[str] = []
-    for donation in republican_donations:
-        committee = donation["committee"]
-        if committee and committee not in committees:
-            committees.append(committee)
-
-    result_label = "FLAGGED"
-    review = False
-    status = "flagged"
-    detail = f"${total:,.0f} across {len(republican_donations)} Republican/aligned donation record(s)."
-    if records_checked >= 25 and not (person.state or person.zip_code):
-        result_label = "FLAGGED — REVIEW"
-        review = True
-        status = "flagged common name"
-        detail += " Common name; verify identity manually."
-
-    return FecResult(
-        status=status,
-        result=result_label,
-        flagged=True,
-        review=review,
-        republican_total=total,
-        republican_count=len(republican_donations),
-        total_records=records_checked,
-        top_recipients=", ".join(committees[:5]),
-        detail=detail,
-    )
+    target = normalize_name(person.full_name)
+    target_last = normalize_name(person.last_name)
+    target_first = normalize_name(person.first_name)
+    rep = []
+    for r in results:
+        donor_name = normalize_name(r.get("contributor_name", ""))
+        if target_last not in donor_name or target_first not in donor_name:
+            continue
+        committee = r.get("committee") or {}
+        committee_name = committee.get("name") or r.get("committee_name") or ""
+        party = committee.get("party") or r.get("committee_party") or ""
+        if is_republican_recipient(committee_name, party):
+            try:
+                amount = float(r.get("contribution_receipt_amount") or 0)
+            except Exception:
+                amount = 0.0
+            rep.append((committee_name, amount))
+    total = len(results)
+    rep_total = sum(x[1] for x in rep)
+    recipients = []
+    for committee, _ in sorted(rep, key=lambda x: x[1], reverse=True):
+        if committee and committee not in recipients:
+            recipients.append(committee)
+    review = total >= 25
+    if rep:
+        detail = f"{len(rep)} Republican/PAC record(s), ${rep_total:,.0f} total"
+    elif review:
+        detail = f"{total} FEC records; common name, review manually"
+    else:
+        detail = "no Republican donations found"
+    return FecMatch("ok", review, bool(rep), total, len(rep), rep_total, "; ".join(recipients[:5]), detail)
 
 
-def build_results_dataframe(
-    source_df: pd.DataFrame,
-    people: list[Person],
-    column_map: dict[str, Any],
-    rebny_results: Optional[dict[int, RebnyResult]] = None,
-    fec_results: Optional[dict[int, FecResult]] = None,
-) -> pd.DataFrame:
-    output = source_df.copy()
-
-    for person in people:
-        idx = person.original_index
-        if rebny_results and idx in rebny_results:
-            for col, value in rebny_results[idx].as_row().items():
-                output.loc[idx, col] = value
-        if fec_results and idx in fec_results:
-            for col, value in fec_results[idx].as_row().items():
-                output.loc[idx, col] = value
-
-    return output
-
-
-def results_summary(
-    people: list[Person],
-    rebny_results: Optional[dict[int, RebnyResult]] = None,
-    fec_results: Optional[dict[int, FecResult]] = None,
-) -> dict[str, int]:
-    summary = {"total": len(people)}
-    if rebny_results is not None:
-        summary["rebny_found"] = sum(1 for result in rebny_results.values() if result.found)
-        summary["rebny_review"] = sum(1 for result in rebny_results.values() if result.review)
-    if fec_results is not None:
-        summary["fec_flagged"] = sum(1 for result in fec_results.values() if result.flagged)
-        summary["fec_review"] = sum(1 for result in fec_results.values() if result.review)
-    return summary
-
-
-def dataframe_to_xlsx_bytes(df: pd.DataFrame) -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Vetting Results")
-    buffer.seek(0)
-
-    workbook = load_workbook(buffer)
-    sheet = workbook.active
-    sheet.freeze_panes = "A2"
-    for cell in sheet[1]:
-        cell.font = Font(bold=True)
-
-    green = PatternFill("solid", fgColor="D9EAD3")
-    red = PatternFill("solid", fgColor="F4CCCC")
-    orange = PatternFill("solid", fgColor="FCE5CD")
-    purple = PatternFill("solid", fgColor="D9D2E9")
-
-    headers = [cell.value for cell in sheet[1]]
-    fec_result_col = headers.index("FEC Result") + 1 if "FEC Result" in headers else None
-    rebny_result_col = headers.index("REBNY Result") + 1 if "REBNY Result" in headers else None
-
-    for row in range(2, sheet.max_row + 1):
-        fill = green
-        fec_value = clean_scalar(sheet.cell(row, fec_result_col).value) if fec_result_col else ""
-        rebny_value = clean_scalar(sheet.cell(row, rebny_result_col).value) if rebny_result_col else ""
-
-        if "FLAGGED" in fec_value:
-            fill = red
-        elif "REVIEW" in fec_value or "REVIEW" in rebny_value:
-            fill = orange
-        elif "FOUND" in rebny_value:
-            fill = purple
-
-        for col in range(1, sheet.max_column + 1):
-            sheet.cell(row, col).fill = fill
-
-    for col_idx in range(1, sheet.max_column + 1):
-        letter = get_column_letter(col_idx)
-        width = min(42, max(12, len(clean_scalar(sheet.cell(1, col_idx).value)) + 4))
-        sheet.column_dimensions[letter].width = width
-
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     out = io.BytesIO()
-    workbook.save(out)
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Vetted")
+    out.seek(0)
     return out.getvalue()

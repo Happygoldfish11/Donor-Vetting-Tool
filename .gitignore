@@ -1,7 +1,5 @@
 __pycache__/
 .pytest_cache/
-*.pyc
 .venv/
-.env
-.DS_Store
-*.log
+diagnostics/
+*.pyc

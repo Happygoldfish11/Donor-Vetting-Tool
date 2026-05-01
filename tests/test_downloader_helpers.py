@@ -1,21 +1,38 @@
-from tools.download_rebny_members import extract_from_json, looks_like_person_name, member_from_text
+from tools.download_rebny_members import parse_text_block, extract_records_from_json, unique
 
 
-def test_looks_like_person_name():
-    assert looks_like_person_name("Jane Doe") is True
-    assert looks_like_person_name("No Search Results Found") is False
-    assert looks_like_person_name("Member Directory") is False
+def test_parse_text_block_person():
+    text = """
+    Member Directory
+    A.J. Rexhepi
+    Century Management Services, Inc. - Residential - Management
+    No Search Results Found
+    """
+    records = parse_text_block(text, "aj")
+    assert any(r.name == "A.J. Rexhepi" for r in records)
+    rec = [r for r in records if r.name == "A.J. Rexhepi"][0]
+    assert "Century" in rec.company
 
 
-def test_member_from_text_extracts_name_and_company():
-    member = member_from_text("Jane Doe\nExample Realty\nBroker", source_query="do")
-    assert member is not None
-    assert member.name == "Jane Doe"
-    assert member.company == "Example Realty"
+def test_parse_text_block_org():
+    text = """
+    Page 1 Properties
+    Residential - Brokerage
+    Palette
+    Residential - Brokerage
+    """
+    records = parse_text_block(text, "pa")
+    names = {r.name for r in records}
+    assert "Page 1 Properties" in names
 
 
-def test_extract_from_json_nested():
-    payload = {"data": {"members": [{"name": "Jane Doe", "company": "Example Realty"}]}}
-    members = extract_from_json(payload)
-    assert len(members) == 1
-    assert members[0].name == "Jane Doe"
+def test_extract_records_from_json():
+    payload = {"results": [{"name": "Jane Doe", "company": "Example Realty", "category": "Residential"}]}
+    records = extract_records_from_json(payload, "jane")
+    assert records[0].name == "Jane Doe"
+    assert records[0].company == "Example Realty"
+
+
+def test_unique():
+    records = parse_text_block("Jane Doe\nExample Realty - Residential\nJane Doe\nExample Realty - Residential", "jane")
+    assert len(unique(records)) == 1

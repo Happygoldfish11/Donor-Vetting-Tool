@@ -4,330 +4,406 @@ import argparse
 import json
 import re
 import string
-import sys
 import time
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import pandas as pd
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from vetting_core import RebnyMember, dedupe_members, normalize_text  # noqa: E402
-
-REBNY_MEMBERS_URL = "https://www.rebny.com/members/"
-
-SEARCH_INPUT_SELECTORS = [
-    "input[placeholder*='Name' i]",
-    "input[aria-label*='Name' i]",
-    "input[name*='name' i]",
-    "input[name*='search' i]",
-    "input[type='search']",
-    "input[type='text']",
-]
-
-SUBMIT_SELECTORS = [
-    "button[type='submit']",
-    "input[type='submit']",
-    "button:has-text('Search')",
-    "a:has-text('Search')",
-]
-
-BAD_NAME_LINES = {
-    "member directory",
-    "search by name",
-    "no search results found",
-    "members",
-    "member resources",
-    "stay connected",
-    "access member resources",
-    "events education",
-    "news media",
-    "resources",
-    "about",
-    "organization",
-    "leadership",
-    "login",
-    "join us",
-    "contact us",
-    "terms of use",
-    "privacy policy",
+NOISE = {
+    "contact us", "search", "login", "join us", "member resources", "stay connected",
+    "residential listing service", "webinar hub", "nyc lease", "events & education",
+    "upcoming events", "sponsorships", "news & media", "resources", "press releases",
+    "photos", "videos", "podcast", "style guide", "advocacy", "research & reports",
+    "testimony & comments", "about", "organization", "staff", "chair", "terms of use",
+    "privacy policy", "membership", "other", "careers", "faq", "member disputes",
+    "member directory", "filter & sort", "search by name", "no search results found",
+    "btn_arrow_white", "icn_accdn_open_white", "image: rebny", "image: nyc skyline",
 }
 
+@dataclass(frozen=True)
+class MemberRecord:
+    name: str
+    company: str = ""
+    category: str = ""
+    source_query: str = ""
+    source_url: str = "https://www.rebny.com/members/"
+    raw_text: str = ""
 
-def seeds(deep: bool, extra: list[str]) -> list[str]:
-    values = [value.strip() for value in extra if value.strip()]
-    if deep:
-        values.extend(string.ascii_lowercase)
-        values.extend(a + b for a in string.ascii_lowercase for b in string.ascii_lowercase)
-    elif not values:
-        values.extend(string.ascii_lowercase)
+    def key(self) -> tuple[str, str, str]:
+        return (norm(self.name), norm(self.company), norm(self.category))
+
+
+def norm(s: str) -> str:
+    s = re.sub(r"\s+", " ", str(s or "").replace("\xa0", " ")).strip().lower()
+    s = re.sub(r"[^a-z0-9 ]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def clean(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "").replace("\xa0", " ")).strip()
+
+
+def is_noise_line(line: str) -> bool:
+    n = norm(line)
+    if not n:
+        return True
+    if n in NOISE:
+        return True
+    if len(n) <= 1:
+        return True
+    if n.endswith(" members") or n == "members":
+        return True
+    if re.fullmatch(r"page\s+\d+", n):
+        return True
+    if "copyright" in n or n.startswith("©"):
+        return True
+    if "rebny 2022 logo" in n:
+        return True
+    return False
+
+
+def likely_person_or_org_name(line: str) -> bool:
+    line = clean(line)
+    if is_noise_line(line):
+        return False
+    n = norm(line)
+    if len(n) < 3 or len(n) > 90:
+        return False
+    if any(x in n for x in ["http", "@", "click", "learn more", "access member"]):
+        return False
+    tokens = n.split()
+    if len(tokens) > 8:
+        return False
+    if re.search(r"\d{3}[-.) ]?\d{3}[- ]?\d{4}", line):
+        return False
+    if re.search(r"\b[A-Za-z]\.?\s+[A-Za-z]", line):
+        return True
+    legal_org = {"llc", "inc", "corp", "company", "properties", "realty", "group", "estate", "management", "partners"}
+    if any(tok in legal_org for tok in tokens):
+        return True
+    return len(tokens) >= 2 and line[0].isupper()
+
+
+def parse_text_block(text: str, source_query: str = "") -> list[MemberRecord]:
+    raw_lines = [clean(x) for x in re.split(r"[\n\r]+", text)]
+    lines = [x for x in raw_lines if x and not is_noise_line(x)]
+    records: list[MemberRecord] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not likely_person_or_org_name(line):
+            i += 1
+            continue
+        name = line.strip(" -–—")
+        company = ""
+        category = ""
+        raw = [line]
+        if i + 1 < len(lines):
+            nxt = lines[i + 1]
+            if not likely_person_or_org_name(nxt) or " - " in nxt or "Residential" in nxt or "Commercial" in nxt:
+                raw.append(nxt)
+                parts = [clean(p) for p in re.split(r"\s+-\s+|\s+–\s+|\s+—\s+", nxt) if clean(p)]
+                if parts:
+                    company = parts[0]
+                    category = " - ".join(parts[1:])
+                else:
+                    company = nxt
+                i += 1
+        if name and not is_noise_line(name):
+            records.append(MemberRecord(name=name, company=company, category=category, source_query=source_query, raw_text=" | ".join(raw)))
+        i += 1
+    return records
+
+
+def extract_records_from_json(obj: Any, source_query: str = "") -> list[MemberRecord]:
+    records: list[MemberRecord] = []
+    def walk(x: Any):
+        if isinstance(x, dict):
+            lowered = {str(k).lower(): v for k, v in x.items()}
+            name = first_value(lowered, ["name", "title", "member_name", "fullname", "full_name", "display_name"])
+            if isinstance(name, dict):
+                name = first_value({str(k).lower(): v for k, v in name.items()}, ["rendered", "value", "text"])
+            if isinstance(name, str) and likely_person_or_org_name(strip_html(name)):
+                company = first_value(lowered, ["company", "organization", "firm", "brokerage", "employer"])
+                category = first_value(lowered, ["category", "member_type", "membership_type", "division", "type"])
+                records.append(MemberRecord(
+                    name=strip_html(name),
+                    company=strip_html(company) if isinstance(company, str) else "",
+                    category=strip_html(category) if isinstance(category, str) else "",
+                    source_query=source_query,
+                    raw_text=json.dumps(x, ensure_ascii=False)[:1500],
+                ))
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for item in x:
+                walk(item)
+    walk(obj)
+    return records
+
+
+def first_value(d: dict, keys: list[str]):
+    for key in keys:
+        if key in d and d[key]:
+            return d[key]
+    for key, value in d.items():
+        if any(k in key for k in keys) and value:
+            return value
+    return ""
+
+
+def strip_html(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    return clean(BeautifulSoup(s, "lxml").get_text(" "))
+
+
+def unique(records: Iterable[MemberRecord]) -> list[MemberRecord]:
     seen = set()
     out = []
-    for value in values:
-        key = value.lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(value)
-    return out
-
-
-def looks_like_person_name(text: str) -> bool:
-    cleaned = re.sub(r"\s+", " ", text).strip()
-    norm = normalize_text(cleaned)
-    if not cleaned or norm in BAD_NAME_LINES:
-        return False
-    if len(cleaned) > 80 or len(cleaned) < 4:
-        return False
-    if "@" in cleaned or "http" in cleaned.lower():
-        return False
-    if any(word in norm.split() for word in ["button", "arrow", "image", "logo", "copyright"]):
-        return False
-    tokens = norm.split()
-    if len(tokens) < 2 or len(tokens) > 5:
-        return False
-    if not all(token.isalpha() for token in tokens):
-        return False
-    return True
-
-
-def member_from_text(text: str, source_query: str = "", url: str = "") -> RebnyMember | None:
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
-    name = ""
-    for line in lines:
-        if looks_like_person_name(line):
-            name = line
-            break
-    if not name:
-        return None
-    company = ""
-    title = ""
-    for line in lines:
-        if line == name:
+    for r in records:
+        if not r.name or is_noise_line(r.name):
             continue
-        low = normalize_text(line)
-        if not company and len(line) <= 90 and not any(x in low for x in ["search", "member directory"]):
-            company = line
-        elif not title and len(line) <= 90:
-            title = line
-    return RebnyMember(name=name, company=company, title=title, profile_url=url, raw_text=" | ".join(lines + [f"query={source_query}"]))
-
-
-def extract_from_json(obj: Any) -> list[RebnyMember]:
-    members: list[RebnyMember] = []
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            keys = {str(k).lower(): k for k in value.keys()}
-            name = ""
-            for key in ["name", "title", "full_name", "fullname", "member_name", "display_name"]:
-                if key in keys:
-                    raw = value.get(keys[key])
-                    if isinstance(raw, str) and looks_like_person_name(raw):
-                        name = raw.strip()
-                        break
-                    if isinstance(raw, dict) and isinstance(raw.get("rendered"), str):
-                        stripped = re.sub(r"<[^>]+>", " ", raw["rendered"])
-                        if looks_like_person_name(stripped):
-                            name = re.sub(r"\s+", " ", stripped).strip()
-                            break
-            if name:
-                company = ""
-                for key in ["company", "firm", "organization", "brokerage"]:
-                    if key in keys and isinstance(value.get(keys[key]), str):
-                        company = value.get(keys[key]).strip()
-                        break
-                url = ""
-                for key in ["url", "link", "permalink"]:
-                    if key in keys and isinstance(value.get(keys[key]), str):
-                        url = value.get(keys[key]).strip()
-                        break
-                members.append(RebnyMember(name=name, company=company, profile_url=url, raw_text=json.dumps(value, default=str)[:1000]))
-            for child in value.values():
-                walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                walk(child)
-
-    walk(obj)
-    return members
-
-
-def install_hint() -> str:
-    return "Install browser support with: python -m playwright install chromium"
+        key = r.key()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return sorted(out, key=lambda r: (norm(r.name), norm(r.company)))
 
 
 def find_search_input(page):
-    for selector in SEARCH_INPUT_SELECTORS:
-        locator = page.locator(selector).first
-        try:
-            if locator.count() and locator.is_visible(timeout=1500):
-                return locator
-        except Exception:
-            continue
+    selectors = [
+        "input[type='search']",
+        "input[placeholder*='Search' i]",
+        "input[aria-label*='Search' i]",
+        "input[name*='search' i]",
+        "input[type='text']",
+    ]
+    for selector in selectors:
+        loc = page.locator(selector)
+        count = loc.count()
+        for i in range(count):
+            item = loc.nth(i)
+            try:
+                if item.is_visible() and item.is_enabled():
+                    return item
+            except Exception:
+                pass
     return None
 
 
-def submit_search(page) -> None:
-    pressed = False
+def click_submit(page):
+    candidates = [
+        "button[type='submit']",
+        "input[type='submit']",
+        "button:has-text('Search')",
+        "a:has-text('Search')",
+        "button[class*='search' i]",
+    ]
+    for selector in candidates:
+        loc = page.locator(selector)
+        for i in range(min(loc.count(), 5)):
+            try:
+                if loc.nth(i).is_visible() and loc.nth(i).is_enabled():
+                    loc.nth(i).click(timeout=1000)
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def settle(page, wait_ms: int = 1200):
     try:
-        page.keyboard.press("Enter")
-        pressed = True
+        page.wait_for_load_state("networkidle", timeout=6000)
     except Exception:
         pass
-    for selector in SUBMIT_SELECTORS:
+    page.wait_for_timeout(wait_ms)
+    for _ in range(3):
         try:
-            button = page.locator(selector).first
-            if button.count() and button.is_visible(timeout=1000):
-                button.click(timeout=2000)
-                return
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(350)
         except Exception:
-            continue
-    if not pressed:
-        page.wait_for_timeout(300)
+            break
+    for txt in ["Load More", "Show More", "More"]:
+        try:
+            btn = page.get_by_text(txt, exact=False)
+            for i in range(min(btn.count(), 3)):
+                if btn.nth(i).is_visible():
+                    btn.nth(i).click(timeout=1000)
+                    page.wait_for_timeout(900)
+        except Exception:
+            pass
 
 
-def extract_visible_members(page, source_query: str) -> list[RebnyMember]:
-    members: list[RebnyMember] = []
+def extract_dom_blocks(page, source_query: str) -> list[MemberRecord]:
     selectors = [
-        "article",
-        "li",
-        "div[class*='member' i]",
-        "div[class*='card' i]",
-        "div[class*='directory' i]",
-        "a[href*='member' i]",
-        "h2, h3, h4",
+        "[class*='member' i]", "[class*='directory' i]", "[class*='result' i]",
+        "article", "li", ".card", "main div",
     ]
-
+    records: list[MemberRecord] = []
     for selector in selectors:
         try:
-            elements = page.locator(selector)
-            count = min(elements.count(), 500)
-            for index in range(count):
-                element = elements.nth(index)
-                try:
-                    if not element.is_visible(timeout=300):
-                        continue
-                    text = element.inner_text(timeout=1000)
-                    href = ""
-                    try:
-                        href = element.get_attribute("href") or ""
-                    except Exception:
-                        pass
-                    member = member_from_text(text, source_query=source_query, url=href)
-                    if member:
-                        members.append(member)
-                except Exception:
-                    continue
+            texts = page.locator(selector).evaluate_all("""
+                els => els.map(e => e.innerText || '').filter(t => t && t.trim().length > 3)
+            """)
         except Exception:
             continue
-
-    return dedupe_members(members)
-
-
-def run_query(page, query: str, wait_ms: int) -> list[RebnyMember]:
-    captured_json: list[Any] = []
-
-    def on_response(response):
-        try:
-            ctype = response.headers.get("content-type", "")
-            url = response.url.lower()
-            if "json" in ctype or "ajax" in url or "wp-json" in url or "graphql" in url:
-                captured_json.append(response.json())
-        except Exception:
-            return
-
-    page.on("response", on_response)
-
-    search_input = find_search_input(page)
-    if search_input is not None:
-        search_input.fill(query, timeout=5000)
-        submit_search(page)
-    else:
-        page.goto(f"{REBNY_MEMBERS_URL}?search={query}", wait_until="networkidle", timeout=30000)
-
-    page.wait_for_timeout(wait_ms)
-
-    members: list[RebnyMember] = []
-    for payload in captured_json:
-        members.extend(extract_from_json(payload))
-    members.extend(extract_visible_members(page, source_query=query))
-
+        for t in texts:
+            records.extend(parse_text_block(t, source_query))
     try:
-        page.remove_listener("response", on_response)
+        records.extend(parse_text_block(page.locator("body").inner_text(timeout=5000), source_query))
     except Exception:
         pass
+    return unique(records)
 
-    return dedupe_members(members)
 
-
-def scrape_rebny_members(headful: bool, deep: bool, extra_queries: list[str], wait_ms: int) -> list[RebnyMember]:
+def search_once(page, query: str, wait_ms: int) -> list[MemberRecord]:
+    inp = find_search_input(page)
+    if inp is None:
+        raise RuntimeError("Could not find the Search By Name input on the REBNY page.")
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise SystemExit("Missing playwright. Run: pip install playwright\n" + install_hint()) from exc
+        inp.fill("")
+        inp.fill(query)
+        page.wait_for_timeout(250)
+        inp.press("Enter")
+    except Exception:
+        inp.fill(query)
+        click_submit(page)
+    settle(page, wait_ms)
+    return extract_dom_blocks(page, query)
 
-    all_members: list[RebnyMember] = []
-    query_list = seeds(deep=deep, extra=extra_queries)
 
+def count_hint(page) -> int | None:
+    try:
+        text = page.locator("body").inner_text(timeout=3000)
+    except Exception:
+        return None
+    m = re.search(r"\b(\d{1,6})\s+Members\b", text, re.I)
+    return int(m.group(1)) if m else None
+
+
+def make_prefixes(deep: bool, max_prefix_len: int) -> list[str]:
+    letters = string.ascii_lowercase
+    prefixes = list(letters)
+    if deep and max_prefix_len >= 2:
+        prefixes += [a + b for a in letters for b in letters]
+    if deep and max_prefix_len >= 3:
+        common = "aeiourstlnmcpdbghfwykvjxzq"
+        prefixes += [a + b + c for a in letters for b in letters for c in common]
+    return prefixes
+
+
+def setup_network_capture(page, diagnostics_dir: Path, network_records: list[MemberRecord], source_query_ref: dict):
+    diagnostics_dir.mkdir(parents=True, exist_ok=True)
+    log_path = diagnostics_dir / "network_log.jsonl"
+    def on_response(resp):
+        url = resp.url
+        lu = url.lower()
+        if not any(k in lu for k in ["member", "search", "api", "ajax", "wp-json"]):
+            return
+        try:
+            ctype = resp.headers.get("content-type", "").lower()
+            if "json" in ctype:
+                data = resp.json()
+                recs = extract_records_from_json(data, source_query_ref.get("query", ""))
+                network_records.extend(recs)
+                with log_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"url": url, "status": resp.status, "records": len(recs), "json_preview": data}, ensure_ascii=False)[:20000] + "\n")
+            elif "text" in ctype or "html" in ctype:
+                text = resp.text()[:100000]
+                recs = parse_text_block(strip_html(text), source_query_ref.get("query", ""))
+                if recs:
+                    network_records.extend(recs)
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({"url": url, "status": resp.status, "records": len(recs), "text_preview": text[:3000]}, ensure_ascii=False) + "\n")
+        except Exception:
+            return
+    page.on("response", on_response)
+
+
+def scrape_members(url: str, deep: bool, max_prefix_len: int, wait_ms: int, diagnostics_dir: Path, limit_prefixes: int = 0) -> list[MemberRecord]:
+    network_records: list[MemberRecord] = []
+    source_query_ref = {"query": ""}
+    all_records: list[MemberRecord] = []
+    prefixes = make_prefixes(deep, max_prefix_len)
+    if limit_prefixes:
+        prefixes = prefixes[:limit_prefixes]
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not headful)
-        page = browser.new_page(viewport={"width": 1440, "height": 1200})
-        page.goto(REBNY_MEMBERS_URL, wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(1200)
-
-        for index, query in enumerate(query_list, start=1):
-            print(f"[{index}/{len(query_list)}] searching {query!r}")
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            viewport={"width": 1400, "height": 1100},
+        )
+        page = context.new_page()
+        setup_network_capture(page, diagnostics_dir, network_records, source_query_ref)
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        settle(page, wait_ms)
+        all_records.extend(extract_dom_blocks(page, "initial"))
+        for idx, prefix in enumerate(prefixes, start=1):
+            source_query_ref["query"] = prefix
             try:
-                members = run_query(page, query=query, wait_ms=wait_ms)
-                all_members.extend(members)
-                print(f"  found {len(members)} visible/API candidate(s); total unique {len(dedupe_members(all_members))}")
+                recs = search_once(page, prefix, wait_ms)
+                all_records.extend(recs)
+                all_records.extend(network_records)
+                all_records = unique(all_records)
+                print(f"[{idx}/{len(prefixes)}] {prefix!r}: {len(recs)} visible, cache={len(all_records)}")
             except Exception as exc:
-                print(f"  warning: query {query!r} failed: {exc}")
-            time.sleep(0.2)
-
+                print(f"[{idx}/{len(prefixes)}] {prefix!r}: ERROR {exc}")
+                try:
+                    page.screenshot(path=str(diagnostics_dir / f"error_{prefix}.png"), full_page=True)
+                    (diagnostics_dir / f"error_{prefix}.html").write_text(page.content(), encoding="utf-8")
+                except Exception:
+                    pass
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                    settle(page, wait_ms)
+                except Exception:
+                    pass
+            time.sleep(0.15)
         browser.close()
+    return unique(all_records + network_records)
 
-    return dedupe_members(all_members)
 
-
-def save_members(members: list[RebnyMember], output: Path) -> None:
+def save_xlsx(records: list[MemberRecord], output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
-    rows = [
-        {
-            "name": member.display_name,
-            "company": member.company,
-            "title": member.title,
-            "profile_url": member.profile_url,
-            "raw_text": member.raw_text,
-        }
-        for member in members
-    ]
-    df = pd.DataFrame(rows).sort_values("name") if rows else pd.DataFrame(columns=["name", "company", "title", "profile_url", "raw_text"])
+    df = pd.DataFrame([asdict(r) for r in records])
+    if df.empty:
+        df = pd.DataFrame(columns=["name", "company", "category", "source_query", "source_url", "raw_text"])
+    df = df.drop_duplicates(subset=["name", "company", "category"]).sort_values(["name", "company"])
     df.to_excel(output, index=False)
-    print(f"Wrote {len(df)} unique member row(s) to {output}")
+    return df
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a local REBNY member cache for the donor vetting app.")
-    parser.add_argument("--output", default="data/rebny_members.xlsx", help="Output XLSX path.")
-    parser.add_argument("--deep", action="store_true", help="Search A-Z and AA-ZZ. Slower but more complete.")
-    parser.add_argument("--headful", action="store_true", help="Show the browser while scraping.")
-    parser.add_argument("--wait-ms", type=int, default=1800, help="Wait after each search.")
-    parser.add_argument("--query", action="append", default=[], help="Extra search query. Can be used multiple times.")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", default="https://www.rebny.com/members/")
+    parser.add_argument("--output", default="data/rebny_members.xlsx")
+    parser.add_argument("--deep", action="store_true")
+    parser.add_argument("--max-prefix-len", type=int, default=2)
+    parser.add_argument("--wait-ms", type=int, default=1200)
+    parser.add_argument("--diagnostics-dir", default="diagnostics/rebny")
+    parser.add_argument("--limit-prefixes", type=int, default=0)
     args = parser.parse_args()
 
-    members = scrape_rebny_members(
-        headful=args.headful,
+    output = Path(args.output)
+    diagnostics = Path(args.diagnostics_dir)
+    records = scrape_members(
+        url=args.url,
         deep=args.deep,
-        extra_queries=args.query,
+        max_prefix_len=args.max_prefix_len,
         wait_ms=args.wait_ms,
+        diagnostics_dir=diagnostics,
+        limit_prefixes=args.limit_prefixes,
     )
-    save_members(members, Path(args.output))
-
+    df = save_xlsx(records, output)
+    print(f"Wrote {len(df):,} records to {output}")
+    if len(df) == 0:
+        print(f"No records found. Check diagnostics in {diagnostics.resolve()}")
 
 if __name__ == "__main__":
     main()
