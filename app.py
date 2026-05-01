@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import time
 import io
+from bs4 import BeautifulSoup
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
@@ -97,9 +98,9 @@ h1, h2, h3 { font-family: 'DM Sans', sans-serif; font-weight: 600; }
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="hero">
-    <div class="badge">FEC · OpenFEC API</div>
+    <div class="badge">FEC · OpenFEC API · REBNY</div>
     <h1>🔍 Donor Vetting Tool</h1>
-    <p>Upload a spreadsheet of names — we'll check each one against FEC records<br>and flag donors to Republican candidates or aligned PACs.</p>
+    <p>Upload a spreadsheet of names — we'll check each one against FEC records,<br>flag donors to Republican candidates or aligned PACs, and check REBNY membership.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -126,6 +127,17 @@ REPUBLICAN_COMMITTEE_KEYWORDS = [
     "congressional leadership fund", "senate leadership fund", "israel"
 ]
 
+REBNY_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.rebny.com/members/",
+}
+
 def is_republican_recipient(committee_name: str, party: str) -> bool:
     if party and party.upper() in REPUBLICAN_PARTY_CODES:
         return True
@@ -134,6 +146,107 @@ def is_republican_recipient(committee_name: str, party: str) -> bool:
         return any(kw in cn for kw in REPUBLICAN_COMMITTEE_KEYWORDS)
     return False
 
+
+# ── REBNY lookup ──────────────────────────────────────────────────────────────
+def lookup_rebny(first_name: str, last_name: str) -> dict:
+    """
+    Check whether a person appears in the REBNY member directory.
+
+    Strategy:
+    1. Try the public-facing search page (renders member count in HTML).
+    2. Parse the result count / any listed names from the page.
+    3. Return a structured dict regardless of outcome.
+    """
+    default = {
+        "rebny_status": "unknown",
+        "rebny_match": False,
+        "rebny_detail": "Could not reach REBNY",
+    }
+
+    query = f"{first_name} {last_name}"
+    url = "https://www.rebny.com/members/"
+
+    try:
+        resp = requests.get(
+            url,
+            params={"search": query},
+            headers=REBNY_HEADERS,
+            timeout=12,
+        )
+
+        if resp.status_code != 200:
+            default["rebny_detail"] = f"HTTP {resp.status_code}"
+            return default
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # ── Attempt 1: look for an explicit "N Members" count element ─────────
+        # REBNY renders something like "1 Members" or "0 Members" near results
+        count_text = None
+        for tag in soup.find_all(string=True):
+            stripped = tag.strip()
+            if stripped.endswith("Members") and stripped.split()[0].isdigit():
+                count_text = stripped
+                break
+
+        if count_text is not None:
+            count = int(count_text.split()[0])
+            if count == 0:
+                return {
+                    "rebny_status": "not found",
+                    "rebny_match": False,
+                    "rebny_detail": "Not in REBNY directory",
+                }
+            else:
+                # Try to grab any listed member name from the page for confirmation
+                member_name_tag = soup.find("h2") or soup.find("h3") or soup.find("p")
+                listed_name = member_name_tag.get_text(strip=True) if member_name_tag else ""
+                detail = f"{count} result(s) found"
+                if listed_name and listed_name.lower() not in ("members", "member directory"):
+                    detail += f" — top result: {listed_name}"
+                return {
+                    "rebny_status": "FOUND",
+                    "rebny_match": True,
+                    "rebny_detail": detail,
+                }
+
+        # ── Attempt 2: look for "No Search Results Found" sentinel ────────────
+        page_text = soup.get_text(" ", strip=True)
+        if "No Search Results Found" in page_text:
+            return {
+                "rebny_status": "not found",
+                "rebny_match": False,
+                "rebny_detail": "Not in REBNY directory",
+            }
+
+        # ── Attempt 3: look for member cards / result containers ──────────────
+        # REBNY uses data attributes or class names on member cards
+        member_cards = (
+            soup.find_all(attrs={"data-member": True})
+            or soup.find_all(class_=lambda c: c and "member" in c.lower() and "result" in c.lower())
+            or soup.find_all(class_=lambda c: c and "directory" in c.lower())
+        )
+        if member_cards:
+            return {
+                "rebny_status": "FOUND",
+                "rebny_match": True,
+                "rebny_detail": f"{len(member_cards)} result(s) found in REBNY directory",
+            }
+
+        # ── Fallback: page loaded but we couldn't parse a definitive answer ───
+        default["rebny_status"] = "parse error"
+        default["rebny_detail"] = "Page loaded but result unclear — check manually"
+        return default
+
+    except requests.exceptions.Timeout:
+        default["rebny_detail"] = "REBNY request timed out"
+        return default
+    except Exception as e:
+        default["rebny_detail"] = str(e)
+        return default
+
+
+# ── FEC lookup ────────────────────────────────────────────────────────────────
 def lookup_donor(first_name: str, last_name: str, api_key: str) -> dict:
     name_query = f"{last_name}, {first_name}".upper()
     url = "https://api.open.fec.gov/v1/schedules/schedule_a/"
@@ -145,7 +258,6 @@ def lookup_donor(first_name: str, last_name: str, api_key: str) -> dict:
         "sort": "-contribution_receipt_date",
     }
 
-    # Default response structure for failures
     default_fail = {
         "status": "error", "flag": False, "needs_review": False,
         "total_contributions": 0, "republican_count": 0,
@@ -210,6 +322,7 @@ def lookup_donor(first_name: str, last_name: str, api_key: str) -> dict:
         default_fail.update({"detail": str(e)})
         return default_fail
 
+
 # ── File upload ───────────────────────────────────────────────────────────────
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.markdown("### 📂 Upload Your Spreadsheet")
@@ -244,7 +357,16 @@ if uploaded:
     st.markdown(f"**{len(df_preview)} names loaded.**")
     st.dataframe(df_preview.head(5), use_container_width=True, hide_index=True)
 
+    # ── Vetting options ───────────────────────────────────────────────────────
+    st.markdown("**Checks to run:**")
+    run_fec = st.checkbox("FEC Republican donation check", value=True)
+    run_rebny = st.checkbox("REBNY member directory check", value=True)
+
     if st.button("🔍 Run Vetting", type="primary", use_container_width=True):
+        if not run_fec and not run_rebny:
+            st.warning("Please select at least one check to run.")
+            st.stop()
+
         results_list = []
         progress = st.progress(0, text="Starting...")
         status_box = st.empty()
@@ -253,15 +375,28 @@ if uploaded:
         for i, row in df_preview.iterrows():
             first = str(row["First Name"]).strip()
             last = str(row["Last Name"]).strip()
-            status_box.markdown(f'<div class="info-box">Checking <b>{first} {last}</b> ({i+1} of {total})...</div>', unsafe_allow_html=True)
+            status_box.markdown(
+                f'<div class="info-box">Checking <b>{first} {last}</b> ({i+1} of {total})...</div>',
+                unsafe_allow_html=True
+            )
 
-            result = lookup_donor(first, last, api_key)
-            result["First Name"] = first
-            result["Last Name"] = last
+            result = {"First Name": first, "Last Name": last}
+
+            if run_fec:
+                fec_result = lookup_donor(first, last, api_key)
+                result.update(fec_result)
+
+            if run_rebny:
+                rebny_result = lookup_rebny(first, last)
+                result.update(rebny_result)
+                # Small delay to be polite to REBNY's server
+                time.sleep(0.5)
+
             results_list.append(result)
-
             progress.progress((i + 1) / total, text=f"{i+1}/{total} checked")
-            time.sleep(0.15)
+
+            if run_fec and not run_rebny:
+                time.sleep(0.15)
 
         status_box.empty()
         progress.empty()
@@ -277,24 +412,46 @@ if uploaded:
                 return "Clean"
 
         out_df = df_preview.copy()
-        out_df["Status"] = [status_label(r) for r in results_list]
-        out_df["GOP Donations ($)"] = [f"${r['republican_total']:,.0f}" if r.get("flag") else "—" for r in results_list]
-        out_df["Top Recipients"] = [r.get("top_recipients", "") for r in results_list]
-        out_df["FEC Records Found"] = [r.get("total_contributions", 0) for r in results_list]
-        out_df["Detail"] = [r.get("detail", "") for r in results_list]
 
-        flagged_count = sum(1 for r in results_list if r.get("flag") and not r.get("needs_review"))
-        review_count = sum(1 for r in results_list if r.get("needs_review"))
-        clean_count = total - flagged_count - review_count
+        if run_fec:
+            out_df["FEC Status"] = [status_label(r) for r in results_list]
+            out_df["GOP Donations ($)"] = [
+                f"${r['republican_total']:,.0f}" if r.get("flag") else "—"
+                for r in results_list
+            ]
+            out_df["Top Recipients"] = [r.get("top_recipients", "") for r in results_list]
+            out_df["FEC Records Found"] = [r.get("total_contributions", 0) for r in results_list]
+            out_df["FEC Detail"] = [r.get("detail", "") for r in results_list]
 
-        st.markdown(f"""
-        <div class="stat-row">
-            <div class="stat"><div class="num">{total}</div><div class="label">Total Checked</div></div>
-            <div class="stat"><div class="num flagged">{flagged_count}</div><div class="label">Flagged</div></div>
-            <div class="stat"><div class="num" style="color:#e3b341">{review_count}</div><div class="label">Review Needed</div></div>
-            <div class="stat"><div class="num clean">{clean_count}</div><div class="label">Clean</div></div>
-        </div>
-        """, unsafe_allow_html=True)
+        if run_rebny:
+            out_df["REBNY Member?"] = [
+                "✅ FOUND" if r.get("rebny_match") else r.get("rebny_status", "unknown")
+                for r in results_list
+            ]
+            out_df["REBNY Detail"] = [r.get("rebny_detail", "") for r in results_list]
+
+        # ── Summary stats ─────────────────────────────────────────────────────
+        stat_html = f'<div class="stat-row"><div class="stat"><div class="num">{total}</div><div class="label">Total Checked</div></div>'
+
+        if run_fec:
+            flagged_count = sum(1 for r in results_list if r.get("flag") and not r.get("needs_review"))
+            review_count  = sum(1 for r in results_list if r.get("needs_review"))
+            clean_count   = total - flagged_count - review_count
+            stat_html += (
+                f'<div class="stat"><div class="num flagged">{flagged_count}</div><div class="label">FEC Flagged</div></div>'
+                f'<div class="stat"><div class="num" style="color:#e3b341">{review_count}</div><div class="label">FEC Review</div></div>'
+                f'<div class="stat"><div class="num clean">{clean_count}</div><div class="label">FEC Clean</div></div>'
+            )
+
+        if run_rebny:
+            rebny_found = sum(1 for r in results_list if r.get("rebny_match"))
+            stat_html += (
+                f'<div class="stat"><div class="num" style="color:#d2a8ff">{rebny_found}</div>'
+                f'<div class="label">REBNY Members</div></div>'
+            )
+
+        stat_html += "</div>"
+        st.markdown(stat_html, unsafe_allow_html=True)
 
         st.markdown("### Results")
         st.dataframe(out_df, use_container_width=True, hide_index=True)
@@ -312,35 +469,57 @@ if uploaded:
                 ws.append(list(row))
 
         flag_col = ws.max_column + 1
-        headers = ["Status", "GOP Donations ($)", "Top Recipients", "FEC Records Found"]
-        for idx, h in enumerate(headers):
+        export_headers = []
+        if run_fec:
+            export_headers += ["FEC Status", "GOP Donations ($)", "Top Recipients", "FEC Records Found", "FEC Detail"]
+        if run_rebny:
+            export_headers += ["REBNY Member?", "REBNY Detail"]
+
+        for idx, h in enumerate(export_headers):
             cell = ws.cell(1, flag_col + idx)
             cell.value = h
             cell.font = Font(bold=True)
 
-        red_fill = PatternFill("solid", start_color="FFCCCC")
+        red_fill    = PatternFill("solid", start_color="FFCCCC")
         orange_fill = PatternFill("solid", start_color="FFE5B4")
-        green_fill = PatternFill("solid", start_color="CCFFCC")
+        green_fill  = PatternFill("solid", start_color="CCFFCC")
+        purple_fill = PatternFill("solid", start_color="E8D5FF")
 
         for i, r in enumerate(results_list, start=2):
-            label = status_label(r)
-            ws.cell(i, flag_col).value = label
-            ws.cell(i, flag_col + 1).value = f"${r['republican_total']:,.0f}" if r.get("flag") else ""
-            ws.cell(i, flag_col + 2).value = r.get("top_recipients", "")
-            ws.cell(i, flag_col + 3).value = r.get("total_contributions", 0)
+            col_offset = 0
 
-            if r.get("flag") and not r.get("needs_review"):
+            if run_fec:
+                label = status_label(r)
+                ws.cell(i, flag_col + col_offset).value = label
+                ws.cell(i, flag_col + col_offset + 1).value = (
+                    f"${r['republican_total']:,.0f}" if r.get("flag") else ""
+                )
+                ws.cell(i, flag_col + col_offset + 2).value = r.get("top_recipients", "")
+                ws.cell(i, flag_col + col_offset + 3).value = r.get("total_contributions", 0)
+                ws.cell(i, flag_col + col_offset + 4).value = r.get("detail", "")
+                col_offset += 5
+
+            if run_rebny:
+                ws.cell(i, flag_col + col_offset).value = (
+                    "FOUND" if r.get("rebny_match") else r.get("rebny_status", "unknown")
+                )
+                ws.cell(i, flag_col + col_offset + 1).value = r.get("rebny_detail", "")
+
+            # Row fill: red > orange > purple > green (priority order)
+            if run_fec and r.get("flag") and not r.get("needs_review"):
                 fill = red_fill
-            elif r.get("needs_review"):
+            elif run_fec and r.get("needs_review"):
                 fill = orange_fill
+            elif run_rebny and r.get("rebny_match"):
+                fill = purple_fill
             else:
                 fill = green_fill
 
-            for c in range(1, flag_col + 4):
+            for c in range(1, flag_col + len(export_headers)):
                 ws.cell(i, c).fill = fill
 
-        for c in range(flag_col, flag_col + 4):
-            ws.column_dimensions[get_column_letter(c)].width = 22
+        for c in range(flag_col, flag_col + len(export_headers)):
+            ws.column_dimensions[get_column_letter(c)].width = 24
 
         buf = io.BytesIO()
         wb.save(buf)
