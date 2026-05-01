@@ -3,7 +3,7 @@ import pandas as pd
 import requests
 import time
 import io
-from bs4 import BeautifulSoup
+import re
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
@@ -178,19 +178,13 @@ def lookup_rebny(first_name: str, last_name: str) -> dict:
             default["rebny_detail"] = f"HTTP {resp.status_code}"
             return default
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = resp.text
 
-        # ── Attempt 1: look for an explicit "N Members" count element ─────────
-        # REBNY renders something like "1 Members" or "0 Members" near results
-        count_text = None
-        for tag in soup.find_all(string=True):
-            stripped = tag.strip()
-            if stripped.endswith("Members") and stripped.split()[0].isdigit():
-                count_text = stripped
-                break
-
-        if count_text is not None:
-            count = int(count_text.split()[0])
+        # ── Attempt 1: look for "N Members" count string ──────────────────────
+        # REBNY renders something like "<strong>1</strong> Members" or "1 Members"
+        count_match = re.search(r'(\d+)\s*Members', html)
+        if count_match:
+            count = int(count_match.group(1))
             if count == 0:
                 return {
                     "rebny_status": "not found",
@@ -198,42 +192,30 @@ def lookup_rebny(first_name: str, last_name: str) -> dict:
                     "rebny_detail": "Not in REBNY directory",
                 }
             else:
-                # Try to grab any listed member name from the page for confirmation
-                member_name_tag = soup.find("h2") or soup.find("h3") or soup.find("p")
-                listed_name = member_name_tag.get_text(strip=True) if member_name_tag else ""
-                detail = f"{count} result(s) found"
-                if listed_name and listed_name.lower() not in ("members", "member directory"):
-                    detail += f" — top result: {listed_name}"
                 return {
                     "rebny_status": "FOUND",
                     "rebny_match": True,
-                    "rebny_detail": detail,
+                    "rebny_detail": f"{count} result(s) found in REBNY directory",
                 }
 
         # ── Attempt 2: look for "No Search Results Found" sentinel ────────────
-        page_text = soup.get_text(" ", strip=True)
-        if "No Search Results Found" in page_text:
+        if "No Search Results Found" in html:
             return {
                 "rebny_status": "not found",
                 "rebny_match": False,
                 "rebny_detail": "Not in REBNY directory",
             }
 
-        # ── Attempt 3: look for member cards / result containers ──────────────
-        # REBNY uses data attributes or class names on member cards
-        member_cards = (
-            soup.find_all(attrs={"data-member": True})
-            or soup.find_all(class_=lambda c: c and "member" in c.lower() and "result" in c.lower())
-            or soup.find_all(class_=lambda c: c and "directory" in c.lower())
-        )
-        if member_cards:
+        # ── Attempt 3: look for member card patterns in raw HTML ──────────────
+        member_hits = len(re.findall(r'data-member|class="[^"]*member-card|class="[^"]*directory-result', html, re.IGNORECASE))
+        if member_hits > 0:
             return {
                 "rebny_status": "FOUND",
                 "rebny_match": True,
-                "rebny_detail": f"{len(member_cards)} result(s) found in REBNY directory",
+                "rebny_detail": f"Member card(s) detected in REBNY directory",
             }
 
-        # ── Fallback: page loaded but we couldn't parse a definitive answer ───
+        # ── Fallback ──────────────────────────────────────────────────────────
         default["rebny_status"] = "parse error"
         default["rebny_detail"] = "Page loaded but result unclear — check manually"
         return default
