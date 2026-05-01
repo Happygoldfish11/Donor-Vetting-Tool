@@ -1,88 +1,56 @@
-"""Spreadsheet ingestion helpers."""
+"""Excel export helpers for vetted results."""
 from __future__ import annotations
 
-from dataclasses import asdict
+import io
 from typing import Any
 
-from .models import Person
-from .normalization import parse_full_name
-
-FIRST_ALIASES = {"first", "first name", "firstname", "given", "given name", "fname"}
-LAST_ALIASES = {"last", "last name", "lastname", "surname", "family", "family name", "lname"}
-FULL_ALIASES = {"name", "full name", "fullname", "donor", "member", "person"}
-STATE_ALIASES = {"state", "st", "contributor state"}
-ZIP_ALIASES = {"zip", "zipcode", "zip code", "postal", "postal code", "contributor zip"}
-EMPLOYER_ALIASES = {"employer", "company", "firm", "organization"}
-OCCUPATION_ALIASES = {"occupation", "title", "role", "job"}
+FILL_COLORS = {
+    "flag": "FFCCCC",
+    "review": "FFE5B4",
+    "rebny": "E8D5FF",
+    "clean": "CCFFCC",
+}
 
 
-def _canonical(col: str) -> str:
-    return " ".join(str(col or "").strip().lower().replace("_", " ").replace("-", " ").split())
+def dataframe_to_excel_bytes(df: Any) -> bytes:
+    """Return an xlsx workbook as bytes with simple status coloring."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
 
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Vetted Results"
 
-def detect_columns(columns: list[str]) -> dict[str, str]:
-    normalized = {_canonical(c): c for c in columns}
-    out: dict[str, str] = {}
+    headers = list(df.columns)
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
 
-    def choose(key: str, aliases: set[str]) -> None:
-        for alias in aliases:
-            if alias in normalized:
-                out[key] = normalized[alias]
-                return
-        for norm, original in normalized.items():
-            if any(alias in norm for alias in aliases):
-                out[key] = original
-                return
-
-    choose("first", FIRST_ALIASES)
-    choose("last", LAST_ALIASES)
-    choose("full", FULL_ALIASES)
-    choose("state", STATE_ALIASES)
-    choose("zip", ZIP_ALIASES)
-    choose("employer", EMPLOYER_ALIASES)
-    choose("occupation", OCCUPATION_ALIASES)
-    return out
-
-
-def row_to_person(row: Any, columns: dict[str, str]) -> Person:
-    def get(key: str) -> str:
-        col = columns.get(key, "")
-        if not col:
-            return ""
-        value = row.get(col, "") if hasattr(row, "get") else ""
-        if value is None:
-            return ""
-        if isinstance(value, float) and str(value) == "nan":
-            return ""
-        return str(value).strip()
-
-    first = get("first")
-    last = get("last")
-    if (not first or not last) and get("full"):
-        parsed_first, parsed_last = parse_full_name(get("full"))
-        first = first or parsed_first
-        last = last or parsed_last
-    return Person(
-        first_name=first,
-        last_name=last,
-        state=get("state"),
-        zip_code=get("zip"),
-        employer=get("employer"),
-        occupation=get("occupation"),
-    )
-
-
-def people_from_dataframe(df: Any) -> list[Person]:
-    columns = detect_columns(list(df.columns))
-    if ("first" not in columns or "last" not in columns) and "full" not in columns:
-        raise ValueError("Could not find First Name + Last Name columns or a Full Name column.")
-    people: list[Person] = []
+    fills = {key: PatternFill("solid", start_color=color) for key, color in FILL_COLORS.items()}
     for _, row in df.iterrows():
-        person = row_to_person(row, columns)
-        if person.first_name or person.last_name:
-            people.append(person)
-    return people
+        values = [row.get(header, "") for header in headers]
+        ws.append(values)
+        excel_row = ws.max_row
+        fec_status = str(row.get("FEC Status", "")).lower()
+        rebny_status = str(row.get("REBNY Status", "")).lower()
+        if "flagged" in fec_status:
+            fill = fills["flag"]
+        elif "review" in fec_status or "review" in rebny_status:
+            fill = fills["review"]
+        elif rebny_status == "found":
+            fill = fills["rebny"]
+        else:
+            fill = fills["clean"]
+        for col in range(1, len(headers) + 1):
+            ws.cell(excel_row, col).fill = fill
 
+    for index, header in enumerate(headers, start=1):
+        max_len = max([len(str(header))] + [len(str(ws.cell(row=r, column=index).value or "")) for r in range(2, ws.max_row + 1)])
+        ws.column_dimensions[get_column_letter(index)].width = min(max(12, max_len + 2), 48)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
 
-def people_preview_rows(people: list[Person], limit: int = 5) -> list[dict[str, str]]:
-    return [asdict(person) for person in people[:limit]]
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()

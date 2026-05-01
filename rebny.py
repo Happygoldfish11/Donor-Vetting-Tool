@@ -1,1 +1,0 @@
-"""Donor Vetting Tool package."""
