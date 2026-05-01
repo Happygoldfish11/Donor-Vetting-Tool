@@ -1,10 +1,12 @@
 import io
 import re
+import shutil
 import sys
 import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
@@ -215,21 +217,38 @@ def likely_result_lines(page_text):
     """
     Return visible lines that could plausibly be REBNY result cards.
 
-    The directory page includes navigation, footer text, and sometimes stale count
-    text. Filtering boilerplate lines keeps the parser focused on actual results.
+    The live page can include the user's typed query above the result counter and
+    stale boilerplate such as "1 Members" plus "No Search Results Found". To
+    avoid treating the search box itself as a directory hit, prefer lines that
+    appear after the first visible member-count line.
     """
+    raw_lines = [" ".join(str(line).split()).strip() for line in str(page_text).splitlines()]
+    has_member_count = any(
+        re.fullmatch(r"\d+\s+members?", normalize_text(line))
+        for line in raw_lines
+    )
+
     lines = []
     seen = set()
-    for raw_line in str(page_text).splitlines():
-        display_line = " ".join(raw_line.split()).strip()
+    in_results_area = not has_member_count
+
+    for display_line in raw_lines:
         normalized = normalize_text(display_line)
-        if not normalized or normalized in seen:
+        if not normalized:
+            continue
+
+        if re.fullmatch(r"\d+\s+members?", normalized):
+            in_results_area = True
+            continue
+
+        if has_member_count and not in_results_area:
+            continue
+
+        if normalized in seen:
             continue
         seen.add(normalized)
 
         if normalized in REBNY_BOILERPLATE_LINES:
-            continue
-        if re.fullmatch(r"\d+\s+members?", normalized):
             continue
         if normalized.startswith("image ") or normalized.startswith("btn arrow"):
             continue
@@ -310,17 +329,25 @@ def classify_rebny_page_text(page_text, first_name, last_name):
 
 
 @dataclass
+class SearchTarget:
+    scope: object
+    locator: object
+    description: str
+
+
+@dataclass
 class REBNYDirectoryClient:
     """
     Reusable Playwright client for REBNY lookups.
 
-    Launching Chromium once per spreadsheet is faster and more reliable than
-    opening a new browser for every donor. Each lookup reloads the directory,
-    fills the actual Search By Name field, submits it, then parses visible text.
+    The REBNY directory is JavaScript-rendered and its static page text can show
+    a stale member count even when the visible result area says there are no
+    search results. This client therefore uses the actual directory search UI
+    when possible, then only trusts visible exact-name matches.
     """
     headless: bool = True
     browser_timeout_ms: int = 30000
-    settle_ms: int = 1200
+    settle_ms: int = 1600
     playwright: Optional[object] = None
     browser: Optional[object] = None
     page: Optional[object] = None
@@ -329,14 +356,41 @@ class REBNYDirectoryClient:
         if not PLAYWRIGHT_AVAILABLE:
             raise RuntimeError("Playwright is not installed")
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=self.headless)
+        self.browser = self._launch_browser()
         self.page = self.browser.new_page(
+            viewport={"width": 1440, "height": 1100},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
-            )
+            ),
         )
         return self
+
+    def _launch_browser(self):
+        launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+        try:
+            return self.playwright.chromium.launch(headless=self.headless, args=launch_args)
+        except Exception as original_error:
+            # Streamlit/Linux deployments sometimes have Chromium installed by
+            # the system package manager even when Playwright's bundled browser
+            # has not been downloaded. Use it before giving up.
+            for candidate in [
+                shutil.which("chromium"),
+                shutil.which("chromium-browser"),
+                shutil.which("google-chrome"),
+                shutil.which("google-chrome-stable"),
+            ]:
+                if not candidate:
+                    continue
+                try:
+                    return self.playwright.chromium.launch(
+                        headless=self.headless,
+                        executable_path=candidate,
+                        args=launch_args,
+                    )
+                except Exception:
+                    continue
+            raise original_error
 
     def close(self):
         try:
@@ -374,18 +428,28 @@ class REBNYDirectoryClient:
         try:
             self.page.goto(REBNY_DIRECTORY_URL, wait_until="domcontentloaded", timeout=self.browser_timeout_ms)
             self._quiet_wait_for_network()
-            search_box = self._find_search_input()
+            self._dismiss_obstructions()
+            self._open_filter_controls()
 
-            if not search_box:
-                default.update({
-                    "rebny_status": "parse error",
-                    "rebny_detail": "Could not find the REBNY Search By Name input",
-                })
-                return default
+            search_target = self._find_search_input()
+            if search_target:
+                self._run_search(search_target, query)
+                page_text = self._results_text()
+                result = classify_rebny_page_text(page_text, first_name, last_name)
+                if result["rebny_status"] != "not found":
+                    return result
+                return result
 
-            self._run_search(search_box, query)
-            page_text = self._results_text()
-            return classify_rebny_page_text(page_text, first_name, last_name)
+            # Coordinate fallback for custom widgets that are keyboard-editable
+            # but not exposed as a normal input/textbox in the DOM.
+            if self._type_near_search_label(query):
+                page_text = self._results_text()
+                return classify_rebny_page_text(page_text, first_name, last_name)
+
+            # Final no-guess fallback: try common query-string forms, but keep the
+            # same strict exact-name parser so ignored parameters cannot become
+            # false positives.
+            return self._lookup_via_url_patterns(first_name, last_name)
 
         except Exception as e:
             default["rebny_detail"] = f"Error: {e}"
@@ -397,57 +461,190 @@ class REBNYDirectoryClient:
         except Exception:
             pass
 
-    def _first_visible(self, selector):
-        locator = self.page.locator(selector)
+    def _settle(self):
+        self._quiet_wait_for_network()
         try:
-            count = min(locator.count(), 30)
+            self.page.wait_for_timeout(self.settle_ms)
+        except Exception:
+            pass
+
+    def _search_scopes(self):
+        scopes = [self.page]
+        try:
+            for frame in self.page.frames:
+                if frame == self.page.main_frame:
+                    continue
+                if frame.url and frame.url != "about:blank":
+                    scopes.append(frame)
+        except Exception:
+            pass
+        return scopes
+
+    def _first_visible_locator(self, locator, limit=40):
+        try:
+            count = min(locator.count(), limit)
         except Exception:
             return None
 
         for i in range(count):
             item = locator.nth(i)
             try:
-                if item.is_visible(timeout=500):
+                if item.is_visible():
                     return item
             except Exception:
                 continue
         return None
 
-    def _find_search_input(self):
-        selectors = [
-            "main input[type='search']",
-            "main input[placeholder*='Search' i]",
-            "main input[aria-label*='Search' i]",
-            "main input[name*='search' i]",
-            "main input[type='text']",
-            "input[type='search']",
-            "input[placeholder*='Search' i]",
-            "input[aria-label*='Search' i]",
-            "input[name*='search' i]",
-            "input[type='text']",
+    def _first_visible_in_scope(self, scope, selector, limit=40):
+        try:
+            return self._first_visible_locator(scope.locator(selector), limit=limit)
+        except Exception:
+            return None
+
+    def _dismiss_obstructions(self):
+        # Cookie/privacy banners vary by environment. Dismiss only clearly named
+        # buttons so we do not accidentally click the directory's search controls.
+        labels = ["Accept", "Accept All", "I Agree", "Got it", "Close", "Dismiss"]
+        for scope in self._search_scopes():
+            for label in labels:
+                try:
+                    button = self._first_visible_locator(scope.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I)), limit=5)
+                    if button:
+                        button.click(timeout=1500)
+                        return
+                except Exception:
+                    continue
+
+    def _open_filter_controls(self):
+        # Some viewport/device combinations hide the directory search in a
+        # Filter & Sort drawer. Click the drawer if it exists, then continue.
+        patterns = [
+            re.compile(r"^Filter\s*&\s*Sort$", re.I),
+            re.compile(r"^Filter", re.I),
         ]
-        for selector in selectors:
-            found = self._first_visible(selector)
-            if found:
-                return found
+        for scope in self._search_scopes():
+            for pattern in patterns:
+                try:
+                    control = self._first_visible_locator(scope.get_by_text(pattern), limit=10)
+                    if control:
+                        control.click(timeout=2500)
+                        self._settle()
+                        return
+                except Exception:
+                    continue
+
+    def _find_search_input(self):
+        """Find the directory search control across the page and any iframes."""
+        scoped_locator_builders = [
+            ("label Search By Name", lambda s: s.get_by_label(re.compile(r"Search\s*By\s*Name", re.I))),
+            ("placeholder Search", lambda s: s.get_by_placeholder(re.compile(r"Search", re.I))),
+            ("role textbox Search By Name", lambda s: s.get_by_role("textbox", name=re.compile(r"Search\s*By\s*Name|Search", re.I))),
+            ("main visible input", lambda s: s.locator("main input:not([type='hidden']), main textarea, main [contenteditable='true'], main [role='textbox']")),
+            ("directory class input", lambda s: s.locator("[class*='member' i] input:not([type='hidden']), [class*='directory' i] input:not([type='hidden']), [class*='filter' i] input:not([type='hidden']), [class*='search' i] input:not([type='hidden'])")),
+            ("any visible textbox", lambda s: s.locator("input:not([type='hidden']), textarea, [contenteditable='true'], [role='textbox']")),
+        ]
+
+        for scope in self._search_scopes():
+            for description, builder in scoped_locator_builders:
+                try:
+                    found = self._first_visible_locator(builder(scope))
+                except Exception:
+                    found = None
+                if found:
+                    return SearchTarget(scope=scope, locator=found, description=description)
         return None
 
-    def _run_search(self, search_box, query):
-        search_box.scroll_into_view_if_needed(timeout=5000)
-        search_box.click(timeout=5000)
-        search_box.fill("", timeout=5000)
-        search_box.fill(query, timeout=5000)
+    def _run_search(self, search_target, query):
+        search_box = search_target.locator
+        scope = search_target.scope
 
-        # Some JS widgets listen to both input and change events. Playwright's
-        # fill() normally emits them, but this explicit dispatch avoids silent
-        # failures on custom search components.
+        try:
+            search_box.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
+
+        typed = False
+        try:
+            search_box.click(timeout=5000)
+            search_box.fill("", timeout=5000)
+            search_box.fill(query, timeout=5000)
+            typed = True
+        except Exception:
+            # Nonstandard custom controls may not support fill(), but they may
+            # still accept normal keyboard input once focused.
+            try:
+                search_box.click(timeout=5000)
+                self.page.keyboard.press("Control+A")
+                self.page.keyboard.press("Backspace")
+                self.page.keyboard.type(query, delay=20)
+                typed = True
+            except Exception:
+                pass
+
+        if typed:
+            self._dispatch_input_events(search_box)
+
+        submitted = False
+        try:
+            search_box.press("Enter", timeout=5000)
+            submitted = True
+        except Exception:
+            try:
+                self.page.keyboard.press("Enter")
+                submitted = True
+            except Exception:
+                pass
+
+        # Submit the control's own form only. Avoid the top-nav global search.
         try:
             handle = search_box.element_handle(timeout=3000)
+            if handle:
+                self.page.evaluate(
+                    """
+                    (el) => {
+                        const form = el.closest && el.closest('form');
+                        if (form && form.requestSubmit) form.requestSubmit();
+                        else if (form) form.submit();
+                    }
+                    """,
+                    handle,
+                )
+                submitted = True
+        except Exception:
+            pass
+
+        # Last UI fallback: search/submit buttons inside the same scope and main
+        # content, not the site's top navigation search link.
+        if not submitted:
+            for selector in [
+                "main form button[type='submit']",
+                "main form input[type='submit']",
+                "main button[type='submit']",
+                "form button[type='submit']",
+                "form input[type='submit']",
+            ]:
+                button = self._first_visible_in_scope(scope, selector, limit=15)
+                if button:
+                    try:
+                        button.click(timeout=5000)
+                        submitted = True
+                        break
+                    except Exception:
+                        continue
+
+        self._settle()
+
+    def _dispatch_input_events(self, locator):
+        try:
+            handle = locator.element_handle(timeout=3000)
+            if not handle:
+                return
             self.page.evaluate(
                 """
                 (el) => {
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Enter' }));
                 }
                 """,
                 handle,
@@ -455,64 +652,92 @@ class REBNYDirectoryClient:
         except Exception:
             pass
 
-        submitted = False
-        for selector in [
-            "main form button[type='submit']",
-            "main form input[type='submit']",
-            "main button[type='submit']",
-            "main button:has-text('Search')",
-            "main [role='button']:has-text('Search')",
-            "button[type='submit']",
-            "button:has-text('Search')",
-            "[role='button']:has-text('Search')",
-        ]:
-            button = self._first_visible(selector)
-            if button:
+    def _type_near_search_label(self, query):
+        for scope in self._search_scopes():
+            try:
+                label = self._first_visible_locator(scope.get_by_text(re.compile(r"Search\s*By\s*Name", re.I)), limit=10)
+                if not label:
+                    continue
+                box = label.bounding_box()
+                if not box:
+                    continue
+
+                # Most directory UIs put the editable box directly below or to
+                # the right of the label. Try both positions and press Enter.
+                click_points = [
+                    (box["x"] + max(box["width"] / 2, 80), box["y"] + box["height"] + 24),
+                    (box["x"] + box["width"] + 140, box["y"] + box["height"] / 2),
+                ]
+                for x, y in click_points:
+                    try:
+                        self.page.mouse.click(x, y)
+                        self.page.keyboard.press("Control+A")
+                        self.page.keyboard.press("Backspace")
+                        self.page.keyboard.type(query, delay=20)
+                        self.page.keyboard.press("Enter")
+                        self._settle()
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return False
+
+    def _lookup_via_url_patterns(self, first_name, last_name):
+        query = f"{first_name} {last_name}".strip()
+        encoded = quote_plus(query)
+        urls = [
+            f"{REBNY_DIRECTORY_URL}?search={encoded}",
+            f"{REBNY_DIRECTORY_URL}?q={encoded}",
+            f"{REBNY_DIRECTORY_URL}?query={encoded}",
+            f"{REBNY_DIRECTORY_URL}?keyword={encoded}",
+            f"{REBNY_DIRECTORY_URL}?name={encoded}",
+            f"{REBNY_DIRECTORY_URL}?member={encoded}",
+            f"{REBNY_DIRECTORY_URL}?member_name={encoded}",
+        ]
+
+        best_result = None
+        for url in urls:
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=self.browser_timeout_ms)
+                self._settle()
+                result = classify_rebny_page_text(self._results_text(), first_name, last_name)
+                if result.get("rebny_match") or result.get("rebny_status") == "review":
+                    result["rebny_detail"] += " (matched through URL fallback)"
+                    return result
+                best_result = result
+            except Exception:
+                continue
+
+        if best_result:
+            best_result["rebny_detail"] = (
+                best_result.get("rebny_detail", "Not in REBNY directory")
+                + " (search control was not exposed; URL fallback did not find an exact match)"
+            )
+            return best_result
+
+        return {
+            "rebny_status": "parse error",
+            "rebny_match": False,
+            "rebny_result_count": "",
+            "rebny_detail": "Could not search REBNY: no exposed search control and URL fallback failed",
+        }
+
+    def _results_text(self):
+        texts = []
+        for scope in self._search_scopes():
+            for selector in ["main", "body"]:
                 try:
-                    button.click(timeout=5000)
-                    submitted = True
-                    break
+                    text = scope.locator(selector).inner_text(timeout=5000)
+                    if text and text.strip():
+                        texts.append(text)
+                        break
                 except Exception:
                     continue
 
-        if not submitted:
-            try:
-                search_box.press("Enter", timeout=5000)
-                submitted = True
-            except Exception:
-                pass
+        if texts:
+            return "\n".join(texts)
 
-        if not submitted:
-            # Last-resort form submit. This is intentionally after the normal
-            # click/Enter path so React-style handlers still get first chance.
-            try:
-                handle = search_box.element_handle(timeout=3000)
-                self.page.evaluate(
-                    """
-                    (el) => {
-                        if (el.form && el.form.requestSubmit) el.form.requestSubmit();
-                        else if (el.form) el.form.submit();
-                    }
-                    """,
-                    handle,
-                )
-            except Exception:
-                pass
-
-        self._quiet_wait_for_network()
-        try:
-            self.page.wait_for_timeout(self.settle_ms)
-        except Exception:
-            pass
-
-    def _results_text(self):
-        for selector in ["main", "body"]:
-            try:
-                text = self.page.locator(selector).inner_text(timeout=5000)
-                if text and text.strip():
-                    return text
-            except Exception:
-                continue
         try:
             return self.page.content()
         except Exception:
@@ -571,7 +796,15 @@ def run_self_tests():
             False,
         ),
         (
-            "exact first-last result is FOUND",
+            "typed query before count is not a result",
+            "Member Directory\nSearch By Name\nJane Definitelyfake\n1 Member\nNo Search Results Found",
+            "Jane",
+            "Definitelyfake",
+            "not found",
+            False,
+        ),
+        (
+            "exact first-last result after count is FOUND",
             "Member Directory\n1 Member\nJane Definitelyfake\nAcme Realty\nLicensed Real Estate Salesperson",
             "Jane",
             "Definitelyfake",
