@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -35,12 +36,23 @@ st.markdown(
 st.title("🔍 Donor Vetting Tool")
 st.caption("Upload names, check OpenFEC records, and match against a local REBNY member cache.")
 
+
+def get_secret(name: str, default: str = "") -> str:
+    env_value = os.environ.get(name)
+    if env_value:
+        return env_value
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return default
+
+
 with st.sidebar:
     st.header("Settings")
     api_key = st.text_input(
         "OpenFEC API key",
         type="password",
-        value=st.secrets.get("FEC_API_KEY", "") if hasattr(st, "secrets") else "",
+        value=get_secret("FEC_API_KEY", ""),
         help="Leave blank to use DEMO_KEY. A personal key is more reliable for larger files.",
     )
 

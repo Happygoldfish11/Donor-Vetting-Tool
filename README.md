@@ -12,7 +12,8 @@ Streamlit app for checking uploaded names against:
 ├── app.py
 ├── vetting_core.py
 ├── requirements.txt
-├── packages.txt
+├── requirements-scraper.txt
+├── requirements-dev.txt
 ├── tools/
 │   └── download_rebny_members.py
 ├── tests/
@@ -28,15 +29,16 @@ Streamlit app for checking uploaded names against:
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m playwright install chromium
 streamlit run app.py
 ```
 
 ## Build the REBNY cache
 
-Run this once locally:
+Install scraper dependencies and run this once locally:
 
 ```bash
+pip install -r requirements-scraper.txt
+python -m playwright install chromium
 python tools/download_rebny_members.py --output data/rebny_members.xlsx --deep
 ```
 
@@ -73,6 +75,7 @@ State and Zip improve FEC disambiguation.
 ## Tests
 
 ```bash
+pip install -r requirements-dev.txt
 python run_tests.py
 pytest
 ```
