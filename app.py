@@ -31,23 +31,56 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
 
+def system_chromium_path():
+    """Return a system Chromium/Chrome executable if Streamlit installed one with packages.txt."""
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        candidate = shutil.which(name)
+        if candidate:
+            return candidate
+    return None
+
+
 def ensure_playwright_chromium():
-    marker = Path.home() / ".cache" / "ms-playwright" / ".chromium_installed"
+    """
+    Make sure Playwright has a browser it can control.
 
-    if marker.exists():
-        return
+    Streamlit should not run browser installation during module import because
+    one transient install failure can prevent the whole app from loading. This
+    function is called only when the REBNY check actually starts.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return False, "Playwright is not installed. Add `playwright` to requirements.txt."
 
-    subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        check=True
-    )
+    if system_chromium_path():
+        return True, "Using system Chromium from packages.txt."
 
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.touch()
+    try:
+        with sync_playwright() as p:
+            bundled_path = Path(p.chromium.executable_path)
+            if bundled_path.exists():
+                return True, "Using Playwright bundled Chromium."
+    except Exception:
+        pass
 
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=180,
+        )
+    except Exception as e:
+        return False, f"Could not run Playwright browser install: {e}"
 
-if PLAYWRIGHT_AVAILABLE:
-    ensure_playwright_chromium()
+    if completed.returncode != 0:
+        output = (completed.stdout or "").strip()
+        if len(output) > 2500:
+            output = output[-2500:]
+        return False, f"Playwright browser install failed. Output: {output}"
+
+    return True, "Installed Playwright bundled Chromium."
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -374,6 +407,11 @@ class REBNYDirectoryClient:
     def start(self):
         if not PLAYWRIGHT_AVAILABLE:
             raise RuntimeError("Playwright is not installed")
+
+        ok, detail = ensure_playwright_chromium()
+        if not ok:
+            raise RuntimeError(detail)
+
         self.playwright = sync_playwright().start()
         self.browser = self._launch_browser()
         self.page = self.browser.new_page(
@@ -387,29 +425,21 @@ class REBNYDirectoryClient:
 
     def _launch_browser(self):
         launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
-        try:
-            return self.playwright.chromium.launch(headless=self.headless, args=launch_args)
-        except Exception as original_error:
-            # Streamlit/Linux deployments sometimes have Chromium installed by
-            # the system package manager even when Playwright's bundled browser
-            # has not been downloaded. Use it before giving up.
-            for candidate in [
-                shutil.which("chromium"),
-                shutil.which("chromium-browser"),
-                shutil.which("google-chrome"),
-                shutil.which("google-chrome-stable"),
-            ]:
-                if not candidate:
-                    continue
-                try:
-                    return self.playwright.chromium.launch(
-                        headless=self.headless,
-                        executable_path=candidate,
-                        args=launch_args,
-                    )
-                except Exception:
-                    continue
-            raise original_error
+
+        # Prefer the system browser installed by Streamlit packages.txt. That
+        # avoids fragile runtime downloads and lets apt install Linux libraries.
+        system_browser = system_chromium_path()
+        if system_browser:
+            try:
+                return self.playwright.chromium.launch(
+                    headless=self.headless,
+                    executable_path=system_browser,
+                    args=launch_args,
+                )
+            except Exception:
+                pass
+
+        return self.playwright.chromium.launch(headless=self.headless, args=launch_args)
 
     def close(self):
         try:
@@ -1200,3 +1230,4 @@ if __name__ == "__main__":
         run_self_tests()
     else:
         main()
+
