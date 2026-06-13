@@ -1,24 +1,25 @@
 import io
 import re
 import shutil
+import subprocess
 import sys
 import time
 import unicodedata
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 try:
     import streamlit as st
 except ImportError:
     st = None
-
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
 
 try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -29,6 +30,24 @@ except ImportError:
     sync_playwright = None
     PLAYWRIGHT_AVAILABLE = False
 
+
+def ensure_playwright_chromium():
+    marker = Path.home() / ".cache" / "ms-playwright" / ".chromium_installed"
+
+    if marker.exists():
+        return
+
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True
+    )
+
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+
+if PLAYWRIGHT_AVAILABLE:
+    ensure_playwright_chromium()
 
 # --------------------------------------------------------------------------- #
 # Constants
